@@ -7,6 +7,7 @@ export interface Look {
   color: string;
   background: string;
   useStlColor: boolean; // STL に色が埋め込まれていればそれで塗る
+  colorMap: Record<string, string>; // STL の色の置き換え（元の色 → 表示する色。ファイルごと）
   keyLight: number;     // キーライト（影付きの点光源）のモデル中心での照度
   fillLight: number;    // 床下からの補助光のモデル中心での照度
   envLight: number;     // 環境光（IBL）の強さ
@@ -79,6 +80,7 @@ export const DEFAULT_LOOK: Look = {
   color: '#8f9aa8',
   background: 'studio_light',
   useStlColor: true,
+  colorMap: {},
   // 環境光を絞って点光源 2 灯で陰影を付けると形が読みやすい（実機で目で合わせた値・2026-10-26）
   keyLight: 1.6,
   fillLight: 1.0,

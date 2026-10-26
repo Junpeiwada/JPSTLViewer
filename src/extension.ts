@@ -13,17 +13,18 @@ const RETRY_INTERVAL_MS = 400;
 const RETRY_COUNT = 5;
 
 /**
- * 見た目の設定。背景は全ファイル共通、材質・色・STL の色を使うかはファイルごとに覚える。
- * 初めて開くファイルは、最後に使った見た目で始める
+ * 見た目の設定。背景は全ファイル共通、材質・色・STL の色を使うか・STL の色の置き換えはファイルごとに覚える。
+ * 初めて開くファイルは、最後に使った見た目で始める（STL の色の置き換えは引き継がない）
  */
 interface Look {
   material: string;
   color: string;
   background: string;
   useStlColor: boolean;
+  colorMap?: Record<string, string>;
 }
 
-type FileLook = Pick<Look, 'material' | 'color' | 'useStlColor'>;
+type FileLook = Pick<Look, 'material' | 'color' | 'useStlColor' | 'colorMap'>;
 
 export function activate(context: vscode.ExtensionContext) {
   const provider = new StlPreviewProvider(context);
@@ -141,6 +142,9 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
         case 'copyColor':
           this.copyColor(uri, msg.color as string);
           break;
+        case 'copyStlColors':
+          this.copyStlColors(uri, msg.colors as { from: string; to: string }[]);
+          break;
       }
     });
 
@@ -162,17 +166,34 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     vscode.window.setStatusBarMessage(`色をコピーしました: ${hex}`, 3000);
   }
 
+  /** STL の色ごとの置き換えをコピーする。変えた色があれば「元 → 新」、無ければ STL の色の一覧 */
+  private async copyStlColors(uri: vscode.Uri, colors: { from: string; to: string }[]) {
+    const rgb = (hex: string) => {
+      const n = parseInt(hex.slice(1), 16);
+      return `RGB ${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+    };
+    const path = vscode.workspace.asRelativePath(uri, false);
+    const changed = colors.filter((c) => c.from !== c.to);
+    const text = changed.length
+      ? [`${path} の色の変更:`, ...changed.map((c) => `${c.from} → ${c.to}（${rgb(c.to)}）`)].join('\n')
+      : [`${path} の色:`, ...colors.map((c) => `${c.from}（${rgb(c.from)}）`)].join('\n');
+    await vscode.env.clipboard.writeText(text);
+    vscode.window.setStatusBarMessage(changed.length ? `色の変更をコピーしました（${changed.length} 色）` : '色の一覧をコピーしました', 3000);
+  }
+
   private fileLooks(): Record<string, FileLook> {
     return this.context.globalState.get<Record<string, FileLook>>(FILES_KEY) ?? {};
   }
 
   private saveLook(uri: vscode.Uri, look: Look) {
-    this.context.globalState.update(STATE_KEY, look);
+    // STL の色の置き換えはそのファイルだけのもの。ほかのファイルに引き継がないよう共通の見た目には入れない
+    const { colorMap, ...shared } = look;
+    this.context.globalState.update(STATE_KEY, shared);
     const files = this.fileLooks();
     const key = uri.toString();
     // 消してから入れ直して、挿入順＝最近使った順にする
     delete files[key];
-    files[key] = { material: look.material, color: look.color, useStlColor: look.useStlColor };
+    files[key] = { material: look.material, color: look.color, useStlColor: look.useStlColor, colorMap: colorMap ?? {} };
     const keys = Object.keys(files);
     for (const old of keys.slice(0, Math.max(0, keys.length - MAX_FILE_LOOKS))) {
       delete files[old];

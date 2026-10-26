@@ -204,3 +204,56 @@ body[data-theme='dark'] {
 #panel button.active {
   background: var(--border);
 }
+
+#colorPanel .row[hidden],
+#stlColors[hidden] {
+  display: none;
+}
+
+#stlColors {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stlColorRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#colorPanel .stlColorRow input[type='color'] {
+  width: 32px;
+  height: 22px;
+}
+
+.stlColorRow .orig {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 9.5em;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.55;
+}
+
+.stlColorRow .orig i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+
+/* 変えた色は元の色の表示を濃くして、元に戻すボタンを出す */
+.stlColorRow.changed .orig {
+  opacity: 0.9;
+}
+
+.stlColorRow button {
+  visibility: hidden;
+}
+
+.stlColorRow.changed button {
+  visibility: visible;
+}

@@ -45,6 +45,7 @@ document.body.insertAdjacentHTML(
 <div id="colorPanel" class="popover" hidden>
   <div class="row"><input id="color" type="color"><input id="colorHex" type="text" maxlength="7" spellcheck="false"></div>
   <label id="stlColorWrap" hidden title="STL に埋め込まれた色で塗る"><input id="stlColor" type="checkbox"> STL の色を使う</label>
+  <div id="stlColors" hidden></div>
   <button id="copyColor" title="ファイル名と色をクリップボードにコピー（AI に「このパーツをこの色に」と頼む用）">色をコピー</button>
 </div>
 <div id="lights" class="popover" hidden>
@@ -62,6 +63,8 @@ const ui = {
   colorHex: document.getElementById('colorHex') as HTMLInputElement,
   colorBtn: document.getElementById('colorBtn') as HTMLButtonElement,
   colorPanel: document.getElementById('colorPanel') as HTMLElement,
+  colorRow: document.querySelector('#colorPanel .row') as HTMLElement,
+  stlColors: document.getElementById('stlColors') as HTMLElement,
   swatch: document.getElementById('swatch') as HTMLElement,
   stlColor: document.getElementById('stlColor') as HTMLInputElement,
   stlColorWrap: document.getElementById('stlColorWrap') as HTMLElement,
@@ -89,6 +92,151 @@ let look: Look = { ...DEFAULT_LOOK };
 let lastData: Uint8Array | null = null;
 let hasModel = false;
 let stlHasColors = false; // 読み込んだ STL に色が埋め込まれているか（ヘッダの COLOR=）
+let palette: StlPalette | null = null; // 読み込んだ STL の色の一覧と、三角形ごとの色の番号
+
+/** STL に埋め込まれた色の一覧（多い順）と、三角形ごとの色の番号 */
+interface StlPalette {
+  colors: string[];   // 元の色（"#rrggbb"。5 ビットの値を 8 ビットに広げたもの）
+  shares: number[];   // 表面積に対する割合
+  faceColor: Uint16Array;
+}
+
+/**
+ * バイナリ STL の色（STLLoader と同じ解釈）を読み、色の一覧を作る。色が無ければ null。
+ * ヘッダの COLOR= ＋ RGBA が既定色、三角形ごとの予備 2 バイトの最上位ビットが 0 なら r | g<<5 | b<<10（各 5 ビット）の固有色
+ */
+function readStlPalette(data: Uint8Array): StlPalette | null {
+  if (data.byteLength < 84) {
+    return null;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const faces = view.getUint32(80, true);
+  if (84 + faces * 50 !== data.byteLength) {
+    return null; // ASCII STL には色が無い
+  }
+  let defaultHex: string | null = null;
+  for (let i = 0; i < 80 - 10; i++) {
+    if (view.getUint32(i, false) === 0x434f4c4f && view.getUint8(i + 4) === 0x52 && view.getUint8(i + 5) === 0x3d) {
+      defaultHex = hex8(view.getUint8(i + 6), view.getUint8(i + 7), view.getUint8(i + 8));
+    }
+  }
+  if (defaultHex === null) {
+    return null;
+  }
+  const index = new Map<string, number>();
+  const counts: number[] = [];   // 色ごとの表面積
+  const raw = new Uint16Array(faces);
+  let total = 0;
+  for (let f = 0; f < faces; f++) {
+    const o = 84 + f * 50 + 12;
+    const p = Array.from({ length: 9 }, (_, i) => view.getFloat32(o + i * 4, true));
+    const ux = p[3] - p[0], uy = p[4] - p[1], uz = p[5] - p[2];
+    const vx = p[6] - p[0], vy = p[7] - p[1], vz = p[8] - p[2];
+    const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+    total += area;
+    const packed = view.getUint16(84 + f * 50 + 48, true);
+    const hex = (packed & 0x8000) === 0
+      ? hex8(...([0, 5, 10].map((s) => Math.round((((packed >> s) & 0x1f) * 255) / 31)) as [number, number, number]))
+      : defaultHex;
+    let k = index.get(hex);
+    if (k === undefined) {
+      k = counts.length;
+      index.set(hex, k);
+      counts.push(0);
+    }
+    counts[k] += area;
+    raw[f] = k;
+  }
+  // 多い順に並べ直す（パネルの上ほど面積の大きい色）
+  const order = counts.map((_, k) => k).sort((a, b) => counts[b] - counts[a]);
+  const rank = new Uint16Array(counts.length);
+  order.forEach((k, r) => (rank[k] = r));
+  const keys = [...index.keys()];
+  return {
+    colors: order.map((k) => keys[k]),
+    shares: order.map((k) => counts[k] / Math.max(total, 1e-12)),
+    faceColor: raw.map((k) => rank[k]),
+  };
+}
+
+function hex8(r: number, g: number, b: number): string {
+  return `#${[r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/** 色の置き換え（look.colorMap）を反映して、頂点色を塗り直す */
+function applyStlColors() {
+  const geom = model.geometry;
+  if (!palette || geom.attributes.position.count !== palette.faceColor.length * 3) {
+    return;
+  }
+  const c = new THREE.Color();
+  const linear = palette.colors.map((hex) => c.set(look.colorMap[hex] ?? hex).toArray() as number[]);
+  const arr = new Float32Array(palette.faceColor.length * 9);
+  palette.faceColor.forEach((k, f) => {
+    const [r, g, b] = linear[k];
+    for (let v = 0; v < 3; v++) {
+      arr.set([r, g, b], f * 9 + v * 3);
+    }
+  });
+  geom.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  requestRaster();
+}
+
+/** 色パネルに、STL の色ごとの行（ピッカー・16 進・元の色と割合・元に戻す）を作る。読み込むたびに作り直す */
+function buildStlColorRows() {
+  ui.stlColors.replaceChildren();
+  if (!palette) {
+    return;
+  }
+  palette.colors.forEach((orig, k) => {
+    const row = document.createElement('div');
+    row.className = 'stlColorRow';
+    row.innerHTML = `<input type="color"><input type="text" maxlength="7" spellcheck="false">
+<span class="orig" title="STL の元の色と、表面積に対する割合"><i></i>${orig} ${Math.max(palette!.shares[k] * 100, 0.1).toFixed(1)}%</span>
+<button title="元の色に戻す">↺</button>`;
+    (row.querySelector('.orig i') as HTMLElement).style.background = orig;
+    const [picker, text] = Array.from(row.querySelectorAll('input'));
+    const set = (hex: string) => {
+      const map = { ...look.colorMap };
+      if (hex === orig) {
+        delete map[orig];
+      } else {
+        map[orig] = hex;
+      }
+      setLook({ colorMap: map });
+      applyStlColors();
+    };
+    picker.addEventListener('input', () => set(picker.value));
+    text.addEventListener('input', () => {
+      const v = text.value.trim();
+      const hex = v.startsWith('#') ? v : `#${v}`;
+      if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
+        set(hex.toLowerCase());
+      }
+    });
+    text.addEventListener('blur', () => (text.value = look.colorMap[orig] ?? orig));
+    row.querySelector('button')!.addEventListener('click', () => set(orig));
+    ui.stlColors.append(row);
+  });
+  syncStlColorRows();
+}
+
+/** 行の値を look.colorMap に合わせる（入力中の欄は触らない） */
+function syncStlColorRows() {
+  if (!palette) {
+    return;
+  }
+  ui.stlColors.querySelectorAll<HTMLElement>('.stlColorRow').forEach((row, k) => {
+    const orig = palette!.colors[k];
+    const cur = look.colorMap[orig] ?? orig;
+    const [picker, text] = Array.from(row.querySelectorAll('input'));
+    picker.value = cur;
+    if (document.activeElement !== text) {
+      text.value = cur;
+    }
+    row.classList.toggle('changed', cur !== orig);
+  });
+}
 
 // ---- レンダラ ----
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
@@ -177,7 +325,10 @@ function loadStl(data: Uint8Array, fit: boolean) {
   model.geometry = geom;
   radius = Math.max(geom.boundingSphere!.radius, 1e-3);
   hasModel = true;
-  stlHasColors = Boolean((geom as THREE.BufferGeometry & { hasColors?: boolean }).hasColors);
+  palette = readStlPalette(data);
+  stlHasColors = palette !== null;
+  applyStlColors();
+  buildStlColorRows();
   applyLook();
 
   layoutScene();
@@ -265,6 +416,10 @@ function applyLook() {
     : look.color;
   ui.stlColor.checked = look.useStlColor;
   ui.stlColorWrap.hidden = !stlHasColors;
+  // STL の色で塗っているときは、1 色のピッカーの代わりに STL の色ごとの行を出す
+  ui.colorRow.hidden = useStlColor;
+  ui.stlColors.hidden = !useStlColor;
+  syncStlColorRows();
   ui.background.value = look.background;
   for (const l of LIGHTS) {
     (document.getElementById(l.key) as HTMLInputElement).value = String(look[l.key]);
@@ -300,7 +455,12 @@ ui.background.addEventListener('change', () => setLook({ background: ui.backgrou
 ui.fit.addEventListener('click', fitView);
 ui.copyColor.addEventListener('click', () => {
   // webview からはクリップボードに書けないことがあるので、拡張側に書かせる
-  vscode.postMessage({ type: 'copyColor', color: look.color });
+  if (stlHasColors && look.useStlColor && palette) {
+    const colors = palette.colors.map((from) => ({ from, to: look.colorMap[from] ?? from }));
+    vscode.postMessage({ type: 'copyStlColors', colors });
+  } else {
+    vscode.postMessage({ type: 'copyColor', color: look.color });
+  }
   ui.copyColor.textContent = 'コピーしました';
   setTimeout(() => (ui.copyColor.textContent = '色をコピー'), 1200);
 });
@@ -404,6 +564,7 @@ window.addEventListener('message', (event) => {
     case 'init':
       config = { ...DEFAULT_CONFIG, ...msg.config };
       look = { ...DEFAULT_LOOK, ...(msg.look ?? {}) };
+      look.colorMap = { ...(look.colorMap ?? {}) };
       if (!MATERIALS[look.material]) {
         look.material = DEFAULT_LOOK.material;
       }
