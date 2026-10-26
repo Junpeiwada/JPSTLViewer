@@ -2,7 +2,7 @@
   "name": "jpstlviewer",
   "displayName": "JP STL Viewer",
   "description": "STL を PBR（環境光 IBL・ソフトシャドウ・AO）で高品位にリアルタイムプレビューする VSCode 拡張。材質プリセットつき、STL の更新で自動リロード。",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "junpeiwada",
   "icon": "images/icon.png",
   "private": true,
