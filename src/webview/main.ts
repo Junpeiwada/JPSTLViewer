@@ -1,7 +1,7 @@
 // STL プレビューの webview 本体。
 // リアルタイム PBR（環境光 IBL・ソフトシャドウ・GTAO・MSAA）で描く。
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -249,9 +249,12 @@ renderer.shadowMap.type = THREE.PCFShadowMap;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 10000);
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true;
-controls.dampingFactor = 0.12;
+// クォータニオンで回転を積むので、裏返しでも極で止まらずどの向きにも同じように回せる
+const controls = new TrackballControls(camera, canvas);
+controls.rotateSpeed = 3; // 画面の端から端までのドラッグでほぼ 1 周（OrbitControls と同じ手応え）
+// 慣性は付けない。Trackball の慣性は止める公開 API が無く、全体表示の後も視点が流れてしまう
+controls.staticMoving = true;
+controls.keys = ['', '', '']; // A/S/D でドラッグの操作を切り替える機能は使わない（入力欄への入力でも反応するため）
 
 // ---- 環境光：RoomEnvironment（スタジオ風の部屋）を PMREM に焼いて IBL にする ----
 scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
@@ -385,6 +388,7 @@ function fitView() {
   const target = new THREE.Vector3(0, model.position.y + top * 0.45, 0);
   const dist = (radius / Math.sin(THREE.MathUtils.degToRad(FOV / 2))) * 1.35;
   camera.position.copy(target).addScaledVector(VIEW_DIR, dist);
+  camera.up.set(0, 1, 0); // 自由回転で傾いた上方向を戻す
   controls.target.copy(target);
   controls.update();
   onCameraChange();
@@ -539,6 +543,7 @@ function resize() {
   composer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  controls.handleResize();
   onCameraChange();
 }
 new ResizeObserver(resize).observe(canvas);
