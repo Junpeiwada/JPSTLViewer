@@ -1,4 +1,4 @@
-// webview 側（Three.js ＋ three-gpu-pathtracer）を 1 本の JS に束ねる。
+// webview 側（Three.js）を 1 本の JS に束ねる。
 // 拡張を CDN に依存させず、オフラインでも動かすため。
 import * as esbuild from 'esbuild';
 
