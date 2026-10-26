@@ -1,0 +1,98 @@
+{
+  "name": "jpstlviewer",
+  "displayName": "JP STL Viewer",
+  "description": "STL を PBR（環境光 IBL・ソフトシャドウ・AO）で高品位にリアルタイムプレビューする VSCode 拡張。材質プリセットつき、STL の更新で自動リロード。",
+  "version": "0.1.0",
+  "publisher": "junpeiwada",
+  "icon": "images/icon.png",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Junpeiwada/JPSTLViewer.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "stl",
+    "3d",
+    "3d printing",
+    "preview",
+    "pbr"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "jpstlviewer.preview",
+        "displayName": "JP STL Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.stl"
+          },
+          {
+            "filenamePattern": "*.STL"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "jpstlviewer.open",
+        "title": "JP STL Viewer: STL をプレビューで開く"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "jpstlviewer.open",
+          "when": "resourceExtname =~ /^\\.stl$/i",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "JP STL Viewer",
+      "properties": {
+        "jpstlviewer.creaseAngle": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "maximum": 180,
+          "description": "この角度（度）未満で接する面どうしは法線を平均して滑らかに陰影を付ける。0 で STL どおりのフラット陰影"
+        },
+        "jpstlviewer.floatRatio": {
+          "type": "number",
+          "default": 0.05,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "モデルを床から浮かせる量（モデルの外接球の半径に対する割合）。大きさに比例するので、どの大きさのモデルでも同じ浮き具合に見える。0 で接地"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p . && tsc -p src/webview && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package",
+    "install-local": "npm run package && \"$(command -v code || echo '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code')\" --install-extension jpstlviewer-$npm_package_version.vsix --force && echo \"\n======\n✅ インストールが正常に完了しました。VSCode をリロード（Cmd+Shift+P →『Developer: Reload Window』）すると新バージョンが有効になります。\n======\"",
+    "publish": "vsce publish",
+    "publish:patch": "vsce publish patch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/three": "^0.186.0",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "0.28.2",
+    "three": "0.186.1",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,13 @@
+.vscode/**
+src/**
+tsconfig.json
+esbuild.mjs
+.gitignore
+**/*.map
+node_modules/**
+Tools/**
+docs/**
+images/**
+!images/icon.png
+**/__pycache__/**
+*.vsix
