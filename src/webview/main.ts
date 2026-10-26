@@ -46,7 +46,7 @@ document.body.insertAdjacentHTML(
   <div class="row"><input id="color" type="color"><input id="colorHex" type="text" maxlength="7" spellcheck="false"></div>
   <label id="stlColorWrap" hidden title="STL に埋め込まれた色で塗る"><input id="stlColor" type="checkbox"> STL の色を使う</label>
   <div id="stlColors" hidden></div>
-  <button id="copyColor" title="ファイル名と色をクリップボードにコピー（AI に「このパーツをこの色に」と頼む用）">色をコピー</button>
+  <button id="copyColor" title="ファイル名と色をクリップボードにコピーする">色をコピー</button>
 </div>
 <div id="lights" class="popover" hidden>
   ${LIGHTS.map((l) => `<label title="${l.title}"><span>${l.label}</span><input id="${l.key}" type="range" min="0" max="${l.max}" step="0.05"><output id="${l.key}Val"></output></label>`).join('')}
