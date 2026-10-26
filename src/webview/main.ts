@@ -1,4 +1,4 @@
-// STL プレビューの webview 本体。
+// STL / 3MF プレビューの webview 本体。
 // リアルタイム PBR（環境光 IBL・ソフトシャドウ・GTAO・MSAA）で描く。
 import * as THREE from 'three';
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
@@ -10,6 +10,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import { BACKGROUNDS, DEFAULT_LOOK, LIGHTS, Look, MATERIALS, applyMaterial } from './looks';
+import { isZip, parse3mf } from './threemf';
 
 declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
 const vscode = acquireVsCodeApi();
@@ -44,7 +45,7 @@ document.body.insertAdjacentHTML(
 </div>
 <div id="colorPanel" class="popover" hidden>
   <div class="row"><input id="color" type="color"><input id="colorHex" type="text" maxlength="7" spellcheck="false"></div>
-  <label id="stlColorWrap" hidden title="STL に埋め込まれた色で塗る"><input id="stlColor" type="checkbox"> STL の色を使う</label>
+  <label id="stlColorWrap" hidden title="ファイルに埋め込まれた色（3MF はフィラメント・材質の色）で塗る"><input id="stlColor" type="checkbox"> ファイルの色を使う</label>
   <div id="stlColors" hidden></div>
   <button id="copyColor" title="ファイル名と色をクリップボードにコピーする">色をコピー</button>
 </div>
@@ -91,10 +92,10 @@ let config: Config = { ...DEFAULT_CONFIG };
 let look: Look = { ...DEFAULT_LOOK };
 let lastData: Uint8Array | null = null;
 let hasModel = false;
-let stlHasColors = false; // 読み込んだ STL に色が埋め込まれているか（ヘッダの COLOR=）
-let palette: StlPalette | null = null; // 読み込んだ STL の色の一覧と、三角形ごとの色の番号
+let stlHasColors = false; // 読み込んだファイルに色が埋め込まれているか（STL はヘッダの COLOR=、3MF はフィラメント・材質）
+let palette: StlPalette | null = null; // 読み込んだファイルの色の一覧と、三角形ごとの色の番号
 
-/** STL に埋め込まれた色の一覧（多い順）と、三角形ごとの色の番号 */
+/** ファイルに埋め込まれた色の一覧（多い順）と、三角形ごとの色の番号 */
 interface StlPalette {
   colors: string[];   // 元の色（"#rrggbb"。5 ビットの値を 8 ビットに広げたもの）
   shares: number[];   // 表面積に対する割合
@@ -102,10 +103,10 @@ interface StlPalette {
 }
 
 /**
- * バイナリ STL の色（STLLoader と同じ解釈）を読み、色の一覧を作る。色が無ければ null。
+ * バイナリ STL の色（STLLoader と同じ解釈）を読み、色の一覧と三角形ごとの番号を返す。色が無ければ null。
  * ヘッダの COLOR= ＋ RGBA が既定色、三角形ごとの予備 2 バイトの最上位ビットが 0 なら r | g<<5 | b<<10（各 5 ビット）の固有色
  */
-function readStlPalette(data: Uint8Array): StlPalette | null {
+function readStlColors(data: Uint8Array): { colors: string[]; faceColor: Uint16Array } | null {
   if (data.byteLength < 84) {
     return null;
   }
@@ -124,36 +125,40 @@ function readStlPalette(data: Uint8Array): StlPalette | null {
     return null;
   }
   const index = new Map<string, number>();
-  const counts: number[] = [];   // 色ごとの表面積
   const raw = new Uint16Array(faces);
-  let total = 0;
   for (let f = 0; f < faces; f++) {
-    const o = 84 + f * 50 + 12;
-    const p = Array.from({ length: 9 }, (_, i) => view.getFloat32(o + i * 4, true));
-    const ux = p[3] - p[0], uy = p[4] - p[1], uz = p[5] - p[2];
-    const vx = p[6] - p[0], vy = p[7] - p[1], vz = p[8] - p[2];
-    const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
-    total += area;
     const packed = view.getUint16(84 + f * 50 + 48, true);
     const hex = (packed & 0x8000) === 0
       ? hex8(...([0, 5, 10].map((s) => Math.round((((packed >> s) & 0x1f) * 255) / 31)) as [number, number, number]))
       : defaultHex;
     let k = index.get(hex);
     if (k === undefined) {
-      k = counts.length;
+      k = index.size;
       index.set(hex, k);
-      counts.push(0);
     }
-    counts[k] += area;
     raw[f] = k;
+  }
+  return { colors: [...index.keys()], faceColor: raw };
+}
+
+/** 色ごとの表面積を測り、多い順に並べた色の一覧にする。positions は三角形ごとに 3 頂点 */
+function makePalette(colors: string[], raw: Uint16Array, positions: ArrayLike<number>): StlPalette {
+  const counts = new Array<number>(colors.length).fill(0); // 色ごとの表面積
+  let total = 0;
+  for (let f = 0; f < raw.length; f++) {
+    const o = f * 9;
+    const ux = positions[o + 3] - positions[o], uy = positions[o + 4] - positions[o + 1], uz = positions[o + 5] - positions[o + 2];
+    const vx = positions[o + 6] - positions[o], vy = positions[o + 7] - positions[o + 1], vz = positions[o + 8] - positions[o + 2];
+    const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+    total += area;
+    counts[raw[f]] += area;
   }
   // 多い順に並べ直す（パネルの上ほど面積の大きい色）
   const order = counts.map((_, k) => k).sort((a, b) => counts[b] - counts[a]);
   const rank = new Uint16Array(counts.length);
   order.forEach((k, r) => (rank[k] = r));
-  const keys = [...index.keys()];
   return {
-    colors: order.map((k) => keys[k]),
+    colors: order.map((k) => colors[k]),
     shares: order.map((k) => counts[k] / Math.max(total, 1e-12)),
     faceColor: raw.map((k) => rank[k]),
   };
@@ -182,7 +187,7 @@ function applyStlColors() {
   requestRaster();
 }
 
-/** 色パネルに、STL の色ごとの行（ピッカー・16 進・元の色と割合・元に戻す）を作る。読み込むたびに作り直す */
+/** 色パネルに、ファイルの色ごとの行（ピッカー・16 進・元の色と割合・元に戻す）を作る。読み込むたびに作り直す */
 function buildStlColorRows() {
   ui.stlColors.replaceChildren();
   if (!palette) {
@@ -192,7 +197,7 @@ function buildStlColorRows() {
     const row = document.createElement('div');
     row.className = 'stlColorRow';
     row.innerHTML = `<input type="color"><input type="text" maxlength="7" spellcheck="false">
-<span class="orig" title="STL の元の色と、表面積に対する割合"><i></i>${orig} ${Math.max(palette!.shares[k] * 100, 0.1).toFixed(1)}%</span>
+<span class="orig" title="ファイルの元の色と、表面積に対する割合"><i></i>${orig} ${Math.max(palette!.shares[k] * 100, 0.1).toFixed(1)}%</span>
 <button title="元の色に戻す">↺</button>`;
     (row.querySelector('.orig i') as HTMLElement).style.background = orig;
     const [picker, text] = Array.from(row.querySelectorAll('input'));
@@ -308,18 +313,31 @@ gtao.blendIntensity = 0.8;
 composer.addPass(gtao);
 composer.addPass(new OutputPass());
 
-// ---- STL の読み込みと配置 ----
+// ---- STL / 3MF の読み込みと配置 ----
 const loader = new STLLoader();
 let radius = 1;
 let lightDist = 1; // ライトからモデル中心までの距離（layoutScene で決める）
 
-function loadStl(data: Uint8Array, fit: boolean) {
+/** 形と色を読む。3MF は ZIP なので先頭のバイトで見分ける（拡張子に頼らない） */
+function parseModel(data: Uint8Array): { geom: THREE.BufferGeometry; colors: { colors: string[]; faceColor: Uint16Array } | null } {
+  if (isZip(data)) {
+    const mesh = parse3mf(data);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
+    geom.computeVertexNormals();
+    return { geom, colors: mesh.colors ? { colors: mesh.colors, faceColor: mesh.faceColor } : null };
+  }
   const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-  let geom = loader.parse(buffer);
-  // build123d などの CAD は Z 上向き、three は Y 上向き
+  return { geom: loader.parse(buffer), colors: readStlColors(data) };
+}
+
+function loadModel(data: Uint8Array, fit: boolean) {
+  const parsed = parseModel(data);
+  let geom = parsed.geom;
+  // build123d などの CAD や 3MF は Z 上向き、three は Y 上向き
   geom.rotateX(-Math.PI / 2);
   if (config.creaseAngle > 0) {
-    // 曲面は法線を平均して滑らかに、折れ目は STL の面法線のまま残す
+    // 曲面は法線を平均して滑らかに、折れ目は面法線のまま残す
     geom = toCreasedNormals(geom, THREE.MathUtils.degToRad(config.creaseAngle));
   }
   geom.computeBoundingBox();
@@ -334,7 +352,7 @@ function loadStl(data: Uint8Array, fit: boolean) {
   model.geometry = geom;
   radius = Math.max(geom.boundingSphere!.radius, 1e-3);
   hasModel = true;
-  palette = readStlPalette(data);
+  palette = parsed.colors && makePalette(parsed.colors.colors, parsed.colors.faceColor, geom.attributes.position.array);
   stlHasColors = palette !== null;
   applyStlColors();
   buildStlColorRows();
@@ -345,7 +363,7 @@ function loadStl(data: Uint8Array, fit: boolean) {
     fitView();
   }
 
-  // 表示は CAD の軸で（STL の X × Y × Z）
+  // 表示は CAD の軸で（ファイルの X × Y × Z）
   const tris = geom.attributes.position.count / 3;
   ui.dims.textContent = `${size.x.toFixed(2)} × ${size.z.toFixed(2)} × ${size.y.toFixed(2)} mm ・ ${tris.toLocaleString()} 三角形`;
   ui.message.textContent = '';
@@ -427,13 +445,13 @@ function applyLook() {
     ui.colorHex.value = look.color;
   }
   ui.colorHex.disabled = useStlColor;
-  // STL の色で塗っているときは、ボタンの見本も「STL の色」と分かる斜線にする
+  // ファイルの色で塗っているときは、ボタンの見本も「ファイルの色」と分かる斜線にする
   ui.swatch.style.background = useStlColor
     ? 'repeating-linear-gradient(45deg, #999 0 3px, #ddd 3px 6px)'
     : look.color;
   ui.stlColor.checked = look.useStlColor;
   ui.stlColorWrap.hidden = !stlHasColors;
-  // STL の色で塗っているときは、1 色のピッカーの代わりに STL の色ごとの行を出す
+  // ファイルの色で塗っているときは、1 色のピッカーの代わりに色ごとの行を出す
   ui.colorRow.hidden = useStlColor;
   ui.stlColors.hidden = !useStlColor;
   syncStlColorRows();
@@ -579,7 +597,16 @@ function toBytes(data: unknown): Uint8Array {
   if (obj && typeof obj === 'object') {
     return Uint8Array.from(Object.values(obj));
   }
-  throw new Error('STL のデータを受け取れませんでした');
+  throw new Error('ファイルのデータを受け取れませんでした');
+}
+
+/** 読めないファイルでも画面が止まらないよう、失敗は画面に出す */
+function tryLoad(data: Uint8Array, fit: boolean) {
+  try {
+    loadModel(data, fit);
+  } catch (err) {
+    ui.message.textContent = `モデルを解釈できませんでした: ${err instanceof Error ? err.message : err}`;
+  }
 }
 
 window.addEventListener('message', (event) => {
@@ -598,7 +625,7 @@ window.addEventListener('message', (event) => {
       const creaseChanged = msg.config.creaseAngle !== config.creaseAngle;
       config = { ...DEFAULT_CONFIG, ...msg.config };
       if (creaseChanged && lastData) {
-        loadStl(lastData, false);
+        tryLoad(lastData, false);
       } else if (hasModel) {
         layoutScene();
         onCameraChange();
@@ -609,12 +636,8 @@ window.addEventListener('message', (event) => {
     case 'reload':
       ui.name.textContent = msg.name;
       lastData = toBytes(msg.data);
-      try {
-        // 再読込では視点を保つ（形を直しながら同じ角度で見比べられるように）
-        loadStl(lastData, msg.type === 'load' || !hasModel);
-      } catch (err) {
-        ui.message.textContent = `STL を解釈できませんでした: ${err}`;
-      }
+      // 再読込では視点を保つ（形を直しながら同じ角度で見比べられるように）
+      tryLoad(lastData, msg.type === 'load' || !hasModel);
       break;
     case 'error':
       ui.message.textContent = msg.message;

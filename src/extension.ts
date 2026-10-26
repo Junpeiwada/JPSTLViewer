@@ -6,7 +6,7 @@ const FILES_KEY = 'jpstlviewer.files';
 // ファイルごとの見た目を覚えておく件数の上限（古いものから捨てる）
 const MAX_FILE_LOOKS = 500;
 
-// ファイルの書き込み途中に読むと壊れた STL を渡してしまうので、変更通知から少し待つ
+// ファイルの書き込み途中に読むと壊れたファイルを渡してしまうので、変更通知から少し待つ
 const RELOAD_DEBOUNCE_MS = 250;
 // 読んだ内容が不完全だったときに読み直すまでの間隔と回数
 const RETRY_INTERVAL_MS = 400;
@@ -36,7 +36,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('jpstlviewer.open', (uri?: vscode.Uri) => {
       const target = uri ?? vscode.window.activeTextEditor?.document.uri;
       if (!target) {
-        vscode.window.showWarningMessage('開く STL ファイルを選んでください');
+        vscode.window.showWarningMessage('開く STL / 3MF ファイルを選んでください');
         return;
       }
       vscode.commands.executeCommand('vscode.openWith', target, VIEW_TYPE);
@@ -48,9 +48,12 @@ export function deactivate() {}
 
 /**
  * バイナリ STL はヘッダの三角形数とファイル長が一致するかで「書き込み完了」を判定できる。
- * ASCII STL は末尾の endsolid の有無で判定する。
+ * ASCII STL は末尾の endsolid の有無で判定する。3MF（ZIP）は ZIP の終端で判定する。
  */
-function isCompleteStl(data: Uint8Array): boolean {
+function isCompleteFile(data: Uint8Array): boolean {
+  if (isZip(data)) {
+    return isCompleteZip(data);
+  }
   if (data.byteLength < 84) {
     return false;
   }
@@ -62,6 +65,26 @@ function isCompleteStl(data: Uint8Array): boolean {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const triangles = view.getUint32(80, true);
   return 84 + triangles * 50 === data.byteLength;
+}
+
+/** 3MF（ZIP）の判定。webview 側（threemf.ts の isZip）にも同じ判定がある */
+function isZip(data: Uint8Array): boolean {
+  return data.byteLength >= 4 && data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04;
+}
+
+/**
+ * 3MF は ZIP。ZIP は末尾に中央ディレクトリ終端（"PK\x05\x06"＋固定 18 バイト＋コメント）を書いて終わるので、
+ * それが末尾にそろっていれば書き込み完了とみなす
+ */
+function isCompleteZip(data: Uint8Array): boolean {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  // コメントは最大 65535 バイト
+  for (let i = data.byteLength - 22; i >= Math.max(0, data.byteLength - 22 - 65535); i--) {
+    if (view.getUint32(i, true) === 0x06054b50 && i + 22 + view.getUint16(i + 20, true) === data.byteLength) {
+      return true;
+    }
+  }
+  return false;
 }
 
 class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
@@ -88,7 +111,7 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
         }
         try {
           const data = await vscode.workspace.fs.readFile(uri);
-          if (isCompleteStl(data) || attempt === RETRY_COUNT) {
+          if (isCompleteFile(data) || attempt === RETRY_COUNT) {
             // readFile は Node の Buffer を返す。Buffer は toJSON を持つので、そのまま送ると
             // {type:'Buffer', data:[…]} に化ける。素の Uint8Array に写してから送る
             panel.webview.postMessage({ type: kind, name: uri.path.split('/').pop(), data: new Uint8Array(data) });
@@ -112,7 +135,7 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
       timer = setTimeout(() => send('reload'), RELOAD_DEBOUNCE_MS);
     };
 
-    // ワークスペース外の STL も監視できるよう、親フォルダ＋ファイル名の相対パターンで張る
+    // ワークスペース外のファイルも監視できるよう、親フォルダ＋ファイル名の相対パターンで張る
     const dir = vscode.Uri.joinPath(uri, '..');
     const name = uri.path.split('/').pop() ?? '';
     const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(dir, name));

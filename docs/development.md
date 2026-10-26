@@ -12,6 +12,7 @@
   - [自動リロード](#自動リロード)
   - [見た目の記憶](#見た目の記憶)
   - [STL の色の読み方](#stl-の色の読み方)
+  - [3MF の読み方](#3mf-の読み方)
   - [webview への STL の渡し方](#webview-への-stl-の渡し方)
 
 ---
@@ -49,7 +50,7 @@ VSCode から実行する場合は ⌘⇧P →「Tasks: Run Task」→「npm: in
 
 ### 自動リロード
 
-STL の更新を監視し、書き込み完了（バイナリはヘッダの三角形数とファイル長の一致、ASCII は `endsolid`）を待ってから読み直す。
+ファイルの更新を監視し、書き込み完了（バイナリ STL はヘッダの三角形数とファイル長の一致、ASCII STL は `endsolid`、3MF は ZIP の中央ディレクトリ終端がファイル末尾にそろうこと）を待ってから読み直す。
 
 ### 見た目の記憶
 
@@ -61,6 +62,16 @@ Three.js の STLLoader と同じ解釈で読む。
 
 - 80 バイトのヘッダのどこかに `COLOR=` ＋ R・G・B・A の 4 バイト → ファイル全体の既定色。**これが無いと色なしとして扱う**
 - 三角形ごとの予備 2 バイト（リトルエンディアン）: 最上位ビットが 0 なら固有色で、`r | g<<5 | b<<10`（各 5 ビット）。最上位ビットが 1 ならヘッダの既定色
+
+### 3MF の読み方
+
+`src/webview/threemf.ts` の自前パーサで読む。Three.js の 3MFLoader は、`p:path` で別の .model を指す部品をオブジェクト番号だけで引くため番号が重なると崩れ、Bambu Studio のフィラメント色も取れないので使わない。
+
+- ZIP は Three.js 同梱の fflate で展開する（`.model` / `.rels` / `.config` だけ。サムネイルや G-code は展開しない）
+- .model は数 MB になるので DOM に組み立てず、正規表現で走査する。属性値の中の `>` や CDATA は扱えない
+- build の item から components をたどって変換を掛け合わせ、全オブジェクトを 1 つの形にまとめる。鏡映の変換では三角形の頂点の順を入れ替えて表を保つ。展開後の三角形は 2,000 万を上限にする
+- 色は Bambu の `Metadata/model_settings.config` のフィラメント番号を `Metadata/project_settings.config` の `filament_colour` で引いたものを優先し、無ければ `basematerials` / `colorgroup`。`<part>` は components と同じ順に並ぶ前提で対応付ける（`<part>` の id は component の objectid と別物）
+- 色の一覧は STL と同じく三角形ごとの番号で持ち、色パネル（色ごとの置き換え）は STL と共通
 
 ### webview への STL の渡し方
 
