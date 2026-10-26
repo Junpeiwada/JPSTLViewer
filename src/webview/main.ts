@@ -275,6 +275,12 @@ scene.add(keyLight);
 const fillLight = new THREE.PointLight(0xffffff, 0, 0, 2);
 scene.add(fillLight);
 
+// カメラに付けた弱い点光源（影なし）。どこから見ても見ている側の暗がりを少し持ち上げる。
+// 子の光源を描かせるため、カメラもシーンに入れる
+const camLight = new THREE.PointLight(0xffffff, 0, 0, 2);
+camera.add(camLight);
+scene.add(camera);
+
 // ---- 床とモデル ----
 const floorMat = new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0 });
 const floor = new THREE.Mesh(new THREE.CircleGeometry(1, 128).rotateX(-Math.PI / 2), floorMat);
@@ -390,6 +396,13 @@ function applyLights() {
   keyLight.intensity = look.keyLight * d2;
   fillLight.intensity = look.fillLight * d2;
   scene.environmentIntensity = look.envLight;
+  applyCamLight();
+}
+
+/** カメラの光は注視点での照度がスライダーの値になるよう、カメラから注視点までの距離で決める */
+function applyCamLight() {
+  const d = camera.position.distanceTo(controls.target);
+  camLight.intensity = look.camLight * d * d;
 }
 
 // ---- 見た目（材質・色・背景・ライト）----
@@ -486,7 +499,12 @@ for (const l of LIGHTS) {
   input.addEventListener('input', () => setLook({ [l.key]: Number(input.value) }));
 }
 ui.lightsReset.addEventListener('click', () =>
-  setLook({ keyLight: DEFAULT_LOOK.keyLight, fillLight: DEFAULT_LOOK.fillLight, envLight: DEFAULT_LOOK.envLight }),
+  setLook({
+    keyLight: DEFAULT_LOOK.keyLight,
+    fillLight: DEFAULT_LOOK.fillLight,
+    envLight: DEFAULT_LOOK.envLight,
+    camLight: DEFAULT_LOOK.camLight,
+  }),
 );
 window.addEventListener('keydown', (e) => {
   if ((e.key === 'f' || e.key === 'F') && !(e.target instanceof HTMLInputElement)) {
@@ -506,6 +524,7 @@ function onCameraChange() {
   const d = camera.position.distanceTo(controls.target);
   fog.near = d + radius * FOG_NEAR;
   fog.far = d + radius * FOG_FAR;
+  applyCamLight();
   requestRaster();
 }
 controls.addEventListener('change', onCameraChange);

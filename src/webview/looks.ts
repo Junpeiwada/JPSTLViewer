@@ -11,13 +11,15 @@ export interface Look {
   keyLight: number;     // キーライト（影付きの点光源）のモデル中心での照度
   fillLight: number;    // 床下からの補助光のモデル中心での照度
   envLight: number;     // 環境光（IBL）の強さ
+  camLight: number;     // カメラに付けた弱い点光源の注視点での照度
 }
 
 /** ライトのスライダー（パネルの並び順） */
-export const LIGHTS: { key: 'keyLight' | 'fillLight' | 'envLight'; label: string; title: string; max: number }[] = [
+export const LIGHTS: { key: 'keyLight' | 'fillLight' | 'envLight' | 'camLight'; label: string; title: string; max: number }[] = [
   { key: 'keyLight', label: 'キー', title: '左前の上から当てる影付きの主光源', max: 4 },
   { key: 'fillLight', label: '補助', title: '床下から当てて底面・裏側を見やすくする光（影なし）', max: 3 },
   { key: 'envLight', label: '環境', title: '全方向からの柔らかい光（スタジオ風の部屋）', max: 3 },
+  { key: 'camLight', label: 'カメラ', title: 'カメラの位置から当てる弱い光（影なし）。見ている側の暗がりを持ち上げる', max: 2 },
 ];
 
 interface MaterialPreset {
@@ -85,6 +87,7 @@ export const DEFAULT_LOOK: Look = {
   keyLight: 1.6,
   fillLight: 1.0,
   envLight: 0.3,
+  camLight: 0.3,
 };
 
 // プリセットを切り替えたときに前の材質の値（透過など）が残らないよう、毎回ここから戻す
