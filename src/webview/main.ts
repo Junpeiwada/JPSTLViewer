@@ -10,6 +10,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import { BACKGROUNDS, DEFAULT_LOOK, LIGHTS, Look, MATERIALS, applyMaterial } from './looks';
+import { Measure } from './measure';
 import { isZip, parse3mf } from './threemf';
 
 declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
@@ -42,6 +43,8 @@ document.body.insertAdjacentHTML(
   <label>背景 <select id="background"></select></label>
   <button id="fit" title="全体が収まる視点に戻す（F）">全体表示</button>
   <button id="lightsBtn" title="ライトの強さを調整する">ライト</button>
+  <button id="measureBtn" title="クリックした 2 点の間の長さを測る（M）。頂点の近くは頂点に吸着、Alt を押しながらで吸着しない">計測</button>
+  <button id="measureClear" title="計測の線をすべて消す（Esc）" hidden>計測を消す</button>
 </div>
 <div id="colorPanel" class="popover" hidden>
   <div class="row"><input id="color" type="color"><input id="colorHex" type="text" maxlength="7" spellcheck="false"></div>
@@ -75,6 +78,8 @@ const ui = {
   lightsBtn: document.getElementById('lightsBtn') as HTMLButtonElement,
   lights: document.getElementById('lights') as HTMLElement,
   lightsReset: document.getElementById('lightsReset') as HTMLButtonElement,
+  measureBtn: document.getElementById('measureBtn') as HTMLButtonElement,
+  measureClear: document.getElementById('measureClear') as HTMLButtonElement,
   name: document.getElementById('name') as HTMLElement,
   dims: document.getElementById('dims') as HTMLElement,
   message: document.getElementById('message') as HTMLElement,
@@ -302,6 +307,13 @@ model.castShadow = true;
 model.receiveShadow = true;
 scene.add(model);
 
+// ---- 長さの計測（画面に重ねる定規）----
+const measure = new Measure(canvas, camera, model, () => {
+  ui.measureBtn.classList.toggle('active', measure.active);
+  ui.measureClear.hidden = !measure.hasSegments;
+  requestMeasureDraw();
+});
+
 // ---- ポストプロセス：MSAA ＋ GTAO（隅や接地部の陰り）----
 const composer = new EffectComposer(
   renderer,
@@ -528,17 +540,33 @@ ui.lightsReset.addEventListener('click', () =>
     camLight: DEFAULT_LOOK.camLight,
   }),
 );
+ui.measureBtn.addEventListener('click', () => measure.setActive(!measure.active));
+ui.measureClear.addEventListener('click', () => measure.clear());
 window.addEventListener('keydown', (e) => {
-  if ((e.key === 'f' || e.key === 'F') && !(e.target instanceof HTMLInputElement)) {
+  if (e.target instanceof HTMLInputElement) {
+    return;
+  }
+  if (e.key === 'f' || e.key === 'F') {
     fitView();
+  } else if (e.key === 'm' || e.key === 'M') {
+    measure.setActive(!measure.active);
+  } else if (e.key === 'Escape') {
+    measure.cancel();
   }
 });
 
 // ---- 描画ループ（変化があったフレームだけ描く）----
 let rasterDirty = true;
+let measureDirty = true;
 
 function requestRaster() {
   rasterDirty = true;
+  measureDirty = true;
+}
+
+/** 定規だけ描き直す（3D の描き直しは要らないとき）*/
+function requestMeasureDraw() {
+  measureDirty = true;
 }
 
 function onCameraChange() {
@@ -572,9 +600,14 @@ function frame() {
   if (!hasModel) {
     return;
   }
+  measure.updateHover();
   if (rasterDirty) {
     composer.render();
     rasterDirty = false;
+  }
+  if (measureDirty) {
+    measure.draw();
+    measureDirty = false;
   }
 }
 
@@ -636,6 +669,9 @@ window.addEventListener('message', (event) => {
     case 'reload':
       ui.name.textContent = msg.name;
       lastData = toBytes(msg.data);
+      if (msg.type === 'load') {
+        measure.clear(); // 別のファイルの計測は意味が無い（再読込では形を直しながら測り直せるよう残す）
+      }
       // 再読込では視点を保つ（形を直しながら同じ角度で見比べられるように）
       tryLoad(lastData, msg.type === 'load' || !hasModel);
       break;

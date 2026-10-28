@@ -257,3 +257,90 @@ body[data-theme='dark'] {
 .stlColorRow.changed button {
   visibility: visible;
 }
+
+#panel button[hidden] {
+  display: none;
+}
+
+/* 計測の定規。canvas の上に重ねるだけで、マウス操作は canvas に通す */
+body.measuring #view {
+  cursor: crosshair;
+}
+
+#measure {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  --ruler: #e8590c;
+  --halo: rgba(255, 255, 255, 0.85);
+}
+
+body[data-theme='dark'] #measure {
+  --ruler: #ff922b;
+  --halo: rgba(0, 0, 0, 0.75);
+}
+
+/* 線・文字の下に背景色寄りの縁取りを敷いて、モデルの上でも読めるようにする */
+#measure line,
+#measure circle,
+#measure text {
+  stroke-linecap: round;
+  paint-order: stroke;
+}
+
+#measure line {
+  stroke: var(--ruler);
+  stroke-width: 1;
+}
+
+#measure .axis {
+  stroke-width: 1.5;
+}
+
+#measure .cap,
+#measure .tick.major {
+  stroke-width: 2;
+}
+
+#measure .tick.mid {
+  stroke-width: 1.5;
+}
+
+#measure .preview {
+  opacity: 0.7;
+}
+
+#measure .pt {
+  fill: var(--halo);
+  stroke: var(--ruler);
+  stroke-width: 1.5;
+}
+
+#measure .pt.snapped {
+  fill: var(--ruler);
+  stroke: var(--halo);
+}
+
+#measure text {
+  fill: var(--ruler);
+  stroke: var(--halo);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  font-variant-numeric: tabular-nums;
+}
+
+#measure .tickLabel {
+  font-size: 10px;
+}
+
+#measure .length {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#measure .axes {
+  font-size: 10px;
+  font-weight: 400;
+}
