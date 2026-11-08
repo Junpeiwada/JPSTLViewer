@@ -11,6 +11,8 @@ const RELOAD_DEBOUNCE_MS = 250;
 // 読んだ内容が不完全だったときに読み直すまでの間隔と回数
 const RETRY_INTERVAL_MS = 400;
 const RETRY_COUNT = 5;
+// GPU の描画が戻らないときの webview の作り直しは、この間隔に 1 回まで（失い続ける環境で作り直しを繰り返さない）
+const REINIT_MIN_INTERVAL_MS = 10000;
 
 /**
  * 見た目の設定。背景は全ファイル共通、材質・色・STL の色を使うか・STL の色の置き換えはファイルごとに覚える。
@@ -29,8 +31,10 @@ type FileLook = Pick<Look, 'material' | 'color' | 'useStlColor' | 'colorMap'>;
 export function activate(context: vscode.ExtensionContext) {
   const provider = new StlPreviewProvider(context);
   context.subscriptions.push(
+    // retainContextWhenHidden は使わない。裏のタブまで WebGL コンテキストと GPU メモリを持ち続けると、
+    // webview 全体で共有するコンテキスト数の上限やメモリ不足で、表のタブの 3D が消えることがある。
+    // 裏に回ると webview は破棄され、戻ると作り直される（視点と計測は webview の state から戻す）
     vscode.window.registerCustomEditorProvider(VIEW_TYPE, provider, {
-      webviewOptions: { retainContextWhenHidden: true },
       supportsMultipleEditorsPerDocument: true,
     }),
     vscode.commands.registerCommand('jpstlviewer.open', (uri?: vscode.Uri) => {
@@ -103,14 +107,23 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     let disposed = false;
     let ready = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastReinit = 0;
+    // webview が作り直される（隠れる・reinit・ready）たびに進める。前の webview 向けに走っていた読み込みを、
+    // 新しい webview に届けない（届くと、戻したばかりの視点と計測を消してしまう）
+    let generation = 0;
+    let changedWhileHidden = false;
 
     const send = async (kind: 'load' | 'reload') => {
+      const gen = generation;
       for (let attempt = 0; attempt <= RETRY_COUNT; attempt++) {
-        if (disposed) {
+        if (disposed || gen !== generation) {
           return;
         }
         try {
           const data = await vscode.workspace.fs.readFile(uri);
+          if (gen !== generation) {
+            return;
+          }
           if (isCompleteFile(data) || attempt === RETRY_COUNT) {
             // readFile は Node の Buffer を返す。Buffer は toJSON を持つので、そのまま送ると
             // {type:'Buffer', data:[…]} に化ける。素の Uint8Array に写してから送る
@@ -118,6 +131,9 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
             return;
           }
         } catch (err) {
+          if (gen !== generation) {
+            return;
+          }
           if (attempt === RETRY_COUNT) {
             panel.webview.postMessage({ type: 'error', message: `読み込みに失敗しました: ${err}` });
             return;
@@ -129,6 +145,11 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
 
     const scheduleReload = () => {
       if (!ready) {
+        return;
+      }
+      if (!panel.visible) {
+        // 隠れている間は読まず、表に戻ったときにまとめて読み直す
+        changedWhileHidden = true;
         return;
       }
       clearTimeout(timer);
@@ -152,6 +173,9 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
       switch (msg.type) {
         case 'ready':
           ready = true;
+          generation++;
+          changedWhileHidden = false;
+          clearTimeout(timer);
           panel.webview.postMessage({
             type: 'init',
             config: this.readConfig(),
@@ -168,6 +192,31 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
         case 'copyStlColors':
           this.copyStlColors(uri, msg.colors as { from: string; to: string }[]);
           break;
+        case 'reinit':
+          // GPU の描画が戻らない。HTML を入れ直して webview を作り直す（作り直した側がまた ready を送ってくる）
+          if (Date.now() - lastReinit < REINIT_MIN_INTERVAL_MS) {
+            panel.webview.postMessage({ type: 'error', message: 'GPU の描画が戻りません。タブを閉じて開き直してください' });
+            break;
+          }
+          lastReinit = Date.now();
+          ready = false;
+          generation++;
+          clearTimeout(timer);
+          // buildHtml は毎回ちがう nonce を入れるので HTML が変わり、webview が読み込み直される
+          panel.webview.html = this.buildHtml(panel.webview, mediaRoot);
+          break;
+      }
+    });
+
+    // 裏に回ると webview はふつう破棄され、戻ると作り直されて ready → load で読み直す。
+    // 破棄されなかった場合に備え、隠れている間の変更は表に戻ったときに読み直す
+    panel.onDidChangeViewState(() => {
+      if (!panel.visible) {
+        clearTimeout(timer);
+        generation++;
+      } else if (changedWhileHidden) {
+        changedWhileHidden = false;
+        scheduleReload();
       }
     });
 

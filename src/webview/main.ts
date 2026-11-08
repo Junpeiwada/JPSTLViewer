@@ -13,8 +13,23 @@ import { BACKGROUNDS, DEFAULT_LOOK, LIGHTS, Look, MATERIALS, applyMaterial } fro
 import { Measure } from './measure';
 import { isZip, parse3mf } from './threemf';
 
-declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
+declare function acquireVsCodeApi(): { postMessage(msg: unknown): void; getState(): unknown; setState(state: unknown): void };
 const vscode = acquireVsCodeApi();
+
+/**
+ * 裏に回ったタブは GPU を手放すため webview ごと破棄される（retainContextWhenHidden を使わない）。
+ * 戻ったときに同じ視点・計測で再開できるよう、webview の state に覚えておく
+ */
+interface ViewState {
+  camera: number[];
+  target: number[];
+  up: number[];
+  segments: number[][];
+  bytes: number; // 覚えたときのファイルの長さ。変わっていたら計測の線は捨てる（形が変わって宙に浮くので）
+}
+const VIEW_SAVE_DELAY_MS = 300;
+// コンテキストを失ってからこの時間内に戻らなければ、webview を作り直してもらう
+const CONTEXT_RESTORE_WAIT_MS = 3000;
 
 interface Config {
   creaseAngle: number;
@@ -99,6 +114,11 @@ let lastData: Uint8Array | null = null;
 let hasModel = false;
 let stlHasColors = false; // 読み込んだファイルに色が埋め込まれているか（STL はヘッダの COLOR=、3MF はフィラメント・材質）
 let palette: StlPalette | null = null; // 読み込んだファイルの色の一覧と、三角形ごとの色の番号
+let viewSaveTimer: ReturnType<typeof setTimeout> | undefined;
+let contextLost = false;
+let receivedLoad = false; // この webview で最初の load を受け取ったか
+const CONTEXT_LOST_MESSAGE = 'GPU の描画が途切れました。復帰を待っています…';
+let contextRestoreTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** ファイルに埋め込まれた色の一覧（多い順）と、三角形ごとの色の番号 */
 interface StlPalette {
@@ -267,7 +287,19 @@ controls.staticMoving = true;
 controls.keys = ['', '', '']; // A/S/D でドラッグの操作を切り替える機能は使わない（入力欄への入力でも反応するため）
 
 // ---- 環境光：RoomEnvironment（スタジオ風の部屋）を PMREM に焼いて IBL にする ----
-scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+// 焼いた結果は GPU 上にしか無いので、コンテキストを失ったら焼き直す
+let envTarget: THREE.WebGLRenderTarget | null = null;
+function bakeEnvironment() {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const room = new RoomEnvironment();
+  const target = pmrem.fromScene(room, 0.04);
+  room.dispose();
+  pmrem.dispose();
+  envTarget?.dispose();
+  envTarget = target;
+  scene.environment = target.texture;
+}
+bakeEnvironment();
 
 // 背景は単色。床は霧で背景色に溶かし、床の縁（地平線）を見せない
 const backgroundColor = new THREE.Color();
@@ -312,6 +344,7 @@ const measure = new Measure(canvas, camera, model, () => {
   ui.measureBtn.classList.toggle('active', measure.active);
   ui.measureClear.hidden = !measure.hasSegments;
   requestMeasureDraw();
+  scheduleViewSave();
 });
 
 // ---- ポストプロセス：MSAA ＋ GTAO（隅や接地部の陰り）----
@@ -576,8 +609,51 @@ function onCameraChange() {
   fog.far = d + radius * FOG_FAR;
   applyCamLight();
   requestRaster();
+  scheduleViewSave();
 }
 controls.addEventListener('change', onCameraChange);
+
+/** 視点と計測を webview の state に覚える。ドラッグ中は毎フレーム呼ばれるので間引く */
+function scheduleViewSave() {
+  if (!hasModel) {
+    return;
+  }
+  clearTimeout(viewSaveTimer);
+  viewSaveTimer = setTimeout(saveViewNow, VIEW_SAVE_DELAY_MS);
+}
+
+function saveViewNow() {
+  clearTimeout(viewSaveTimer);
+  if (!hasModel) {
+    return;
+  }
+  const state: ViewState = {
+    camera: camera.position.toArray(),
+    target: controls.target.toArray(),
+    up: camera.up.toArray(),
+    segments: measure.getSegments(),
+    bytes: lastData?.byteLength ?? 0,
+  };
+  vscode.setState(state);
+}
+// ドラッグを離したらすぐ覚える（直後にタブを切り替えても最後の視点が残るように）
+controls.addEventListener('end', saveViewNow);
+
+/** 覚えておいた視点と計測に戻す。形が壊れていれば false（呼び出し側で全体表示にする）*/
+function restoreView(s: Partial<ViewState> | undefined): boolean {
+  const ok = (v: unknown): v is number[] => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
+  if (!s || !ok(s.camera) || !ok(s.target) || !ok(s.up)) {
+    return false;
+  }
+  camera.position.fromArray(s.camera);
+  camera.up.fromArray(s.up);
+  controls.target.fromArray(s.target);
+  controls.update();
+  const sameFile = s.bytes === lastData?.byteLength;
+  measure.setSegments(sameFile && Array.isArray(s.segments) ? s.segments : []);
+  onCameraChange();
+  return true;
+}
 
 function resize() {
   const w = canvas.clientWidth;
@@ -594,11 +670,38 @@ function resize() {
 }
 new ResizeObserver(resize).observe(canvas);
 
+// ---- WebGL コンテキストの喪失と復帰 ----
+// GPU のリセットやメモリ不足、WebGL コンテキスト数の上限（webview 全体で共有）で、3D の絵だけが消えることがある。
+// three は preventDefault して復帰を待ち、戻ればバッファ・テクスチャを積み直す。焼いた環境マップだけは自前で焼き直す
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  contextLost = true;
+  ui.message.textContent = CONTEXT_LOST_MESSAGE;
+  clearTimeout(contextRestoreTimer);
+  contextRestoreTimer = setTimeout(() => {
+    if (contextLost) {
+      // 戻らないときは webview ごと作り直してもらう（視点と計測は state から戻る）
+      vscode.postMessage({ type: 'reinit' });
+    }
+  }, CONTEXT_RESTORE_WAIT_MS);
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  contextLost = false;
+  clearTimeout(contextRestoreTimer);
+  // 古い環境マップは失ったコンテキストのもの。dispose すると無効なオブジェクトを消そうとするので、捨てるだけにする
+  envTarget = null;
+  bakeEnvironment();
+  if (ui.message.textContent === CONTEXT_LOST_MESSAGE) {
+    ui.message.textContent = ''; // ほかのエラー表示は消さない
+  }
+  requestRaster();
+});
+
 function frame() {
   requestAnimationFrame(frame);
   controls.update();
-  if (!hasModel) {
-    return;
+  if (!hasModel || contextLost) {
+    return; // 失っている間は描かない（汚れた印を残し、復帰後に描く）
   }
   measure.updateHover();
   if (rasterDirty) {
@@ -668,7 +771,22 @@ window.addEventListener('message', (event) => {
     case 'load':
     case 'reload':
       ui.name.textContent = msg.name;
+      if (msg.type === 'reload' && !receivedLoad) {
+        break; // 最初の load より前に届いた再読込は捨てる（すぐ後に load が来る）
+      }
       lastData = toBytes(msg.data);
+      if (msg.type === 'load' && !receivedLoad) {
+        receivedLoad = true;
+        const saved = vscode.getState() as Partial<ViewState> | undefined;
+        if (saved) {
+          // 裏から戻って webview が作り直されたとき：前の視点と計測で再開する
+          tryLoad(lastData, false);
+          if (hasModel && !restoreView(saved)) {
+            fitView();
+          }
+          break;
+        }
+      }
       if (msg.type === 'load') {
         measure.clear(); // 別のファイルの計測は意味が無い（再読込では形を直しながら測り直せるよう残す）
       }

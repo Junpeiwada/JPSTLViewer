@@ -90,6 +90,20 @@ export class Measure {
     this.onChange();
   }
 
+  /** 確定した計測を保存できる形（1 本につき [ax, ay, az, bx, by, bz]）で返す。webview を作り直しても戻せるように */
+  getSegments(): number[][] {
+    return this.segments.map(([a, b]) => [...a.toArray(), ...b.toArray()]);
+  }
+
+  /** getSegments で保存した計測を戻す */
+  setSegments(list: number[][]) {
+    this.segments = list
+      .filter((s) => Array.isArray(s) && s.length === 6 && s.every(Number.isFinite))
+      .map((s) => [new THREE.Vector3(s[0], s[1], s[2]), new THREE.Vector3(s[3], s[4], s[5])]);
+    this.pending = null;
+    this.onChange();
+  }
+
   /** 描画ループから毎フレーム呼ぶ。カーソルが動いたときだけレイを飛ばす（重いメッシュでも 1 フレーム 1 回まで）*/
   updateHover() {
     if (!this.pointerMoved) {

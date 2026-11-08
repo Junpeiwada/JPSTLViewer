@@ -14,6 +14,7 @@
   - [STL の色の読み方](#stl-の色の読み方)
   - [3MF の読み方](#3mf-の読み方)
   - [webview への STL の渡し方](#webview-への-stl-の渡し方)
+  - [裏のタブと GPU コンテキスト](#裏のタブと-gpu-コンテキスト)
 
 ---
 
@@ -76,3 +77,10 @@ Three.js の STLLoader と同じ解釈で読む。
 ### webview への STL の渡し方
 
 拡張側で読んだ STL のバイト列を `postMessage` で webview に渡す。Three.js は esbuild で `media/webview.js` に同梱しており、オフラインで動く。
+
+### 裏のタブと GPU コンテキスト
+
+`retainContextWhenHidden` は使わない。裏のタブも WebGL コンテキストと GPU メモリ（影・MSAA・GTAO・環境マップ）を持ち続けると、webview 全体で共有するコンテキスト数の上限やメモリ不足で、表のタブの 3D だけが消える（ツールは残る）ことがある。
+裏に回ると webview は破棄され、戻ると作り直してファイルを読み直す。視点（カメラ・注視点・上方向）と計測の線は `vscode.setState` に覚えておき、作り直したときに戻す。
+
+それでもコンテキストを失ったとき（GPU のリセットなど）は、three の自動復帰を待ち、戻ったら PMREM の環境マップを焼き直して描き直す。3 秒たっても戻らなければ webview が `reinit` を送り、拡張が HTML を入れ直して作り直す（作り直しは 10 秒に 1 回まで）。
