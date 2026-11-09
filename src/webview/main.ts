@@ -34,6 +34,7 @@ const CONTEXT_RESTORE_WAIT_MS = 3000;
 interface Config {
   creaseAngle: number;
   floatRatio: number; // 床から浮かせる量（モデル半径に対する割合）
+  periodicRedraw: boolean; // 一定間隔で描き直す（白くなる不具合の対策。切ると原因を調べやすい）
 }
 
 // ===== 見た目の定数 ===================================================
@@ -103,11 +104,17 @@ const ui = {
 // 例外で黙って真っ白にならないよう、捕まえ損ねたエラーは画面に出す
 const showError = (err: unknown) => {
   ui.message.textContent = `エラー: ${err instanceof Error ? err.message : String(err)}`;
+  log(`エラー: ${err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err)}`);
 };
+
+/** 拡張の出力パネル「JP STL Viewer」に書く（webview の中のことは、外から見る手段がこれしかない）*/
+function log(message: string) {
+  vscode.postMessage({ type: 'log', message });
+}
 window.addEventListener('error', (e) => showError(e.error ?? e.message));
 window.addEventListener('unhandledrejection', (e) => showError(e.reason));
 
-const DEFAULT_CONFIG: Config = { creaseAngle: 30, floatRatio: 0.05 };
+const DEFAULT_CONFIG: Config = { creaseAngle: 30, floatRatio: 0.05, periodicRedraw: true };
 let config: Config = { ...DEFAULT_CONFIG };
 let look: Look = { ...DEFAULT_LOOK };
 let lastData: Uint8Array | null = null;
@@ -675,17 +682,20 @@ new ResizeObserver(resize).observe(canvas);
 // three は preventDefault して復帰を待ち、戻ればバッファ・テクスチャを積み直す。焼いた環境マップだけは自前で焼き直す
 canvas.addEventListener('webglcontextlost', (e) => {
   e.preventDefault();
+  log('WebGL コンテキストを失った');
   contextLost = true;
   ui.message.textContent = CONTEXT_LOST_MESSAGE;
   clearTimeout(contextRestoreTimer);
   contextRestoreTimer = setTimeout(() => {
     if (contextLost) {
       // 戻らないときは webview ごと作り直してもらう（視点と計測は state から戻る）
+      log(`${CONTEXT_RESTORE_WAIT_MS}ms 待っても戻らないので作り直しを頼む`);
       vscode.postMessage({ type: 'reinit' });
     }
   }, CONTEXT_RESTORE_WAIT_MS);
 });
 canvas.addEventListener('webglcontextrestored', () => {
+  log('WebGL コンテキストが戻った');
   contextLost = false;
   clearTimeout(contextRestoreTimer);
   // 古い環境マップは失ったコンテキストのもの。dispose すると無効なオブジェクトを消そうとするので、捨てるだけにする
@@ -699,20 +709,126 @@ canvas.addEventListener('webglcontextrestored', () => {
 
 function frame() {
   requestAnimationFrame(frame);
+  const now = performance.now();
+  if (now - lastFrameAt > RAF_GAP_LOG_MS && document.visibilityState === 'visible') {
+    log(`描画ループが再開した（${Math.round(now - lastFrameAt)}ms 止まっていた）`);
+  }
+  lastFrameAt = now;
   controls.update();
   if (!hasModel || contextLost) {
     return; // 失っている間は描かない（汚れた印を残し、復帰後に描く）
   }
   measure.updateHover();
   if (rasterDirty) {
+    const sinceLast = now - lastRasterAt;
     composer.render();
+    lastRasterAt = now;
     rasterDirty = false;
+    if (probeReason) {
+      const reason = probeReason;
+      probeReason = null;
+      probe(reason, sinceLast);
+    }
   }
   if (measureDirty) {
     measure.draw();
     measureDirty = false;
   }
 }
+
+// ---- 描画の見張り（3D が白くなる不具合を追うため）----
+// 変化があったときだけ描くので、canvas の中身が何かの拍子に捨てられると、白いまま描き直されない。
+// 一定間隔（設定 periodicRedraw）と、表に戻ったとき・フォーカスを得たとき・コマンドで描き直す。
+// あわせて描いた直後の画素を読み、「描いた結果が白い」のか「描いた結果は正しいのに画面が白い」のかをログで見分ける
+const HEALTH_INTERVAL_MS = 10000;
+const RAF_GAP_LOG_MS = 2000; // 表示中に描画ループがこれ以上止まっていたら書く
+type ProbeReason = '定期' | '表示' | 'フォーカス' | '読み込み' | '手動';
+let probeReason: ProbeReason | null = null;
+let lastProbe = '';
+let lastFrameAt = performance.now();
+let lastRasterAt = performance.now();
+
+function requestProbe(reason: ProbeReason) {
+  if (!hasModel || contextLost) {
+    if (reason === '手動') {
+      log(`描画の確認: できない（${!hasModel ? 'モデルが無い' : 'コンテキスト喪失中'}）`);
+    }
+    return;
+  }
+  probeReason = reason;
+  requestRaster();
+}
+
+/**
+ * 描いた直後に画面（既定のフレームバッファ）の中央と左上の隅の色を読む。
+ * 定期のときは結果が前回と変わったときだけ、それ以外（ユーザーが白い画面に気づいて触ったときなど）は必ず書く
+ */
+function probe(reason: ProbeReason, sinceLast: number) {
+  const gl = renderer.getContext();
+  renderer.setRenderTarget(null);
+  const w = gl.drawingBufferWidth;
+  const h = gl.drawingBufferHeight;
+  const pixel = (x: number, y: number) => {
+    const b = new Uint8Array(4);
+    gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b);
+    return `${b[0]},${b[1]},${b[2]}`;
+  };
+  const center = pixel(w >> 1, h >> 1);
+  const corner = pixel(Math.min(4, w - 1), Math.max(0, h - 5)); // readPixels の y は下から
+  const err = gl.getError();
+  const cam = camera.position.toArray().map((v) => Number(v.toFixed(2))).join(',');
+  const line = [
+    `中央 ${center}`,
+    `隅 ${corner}`,
+    `バッファ ${w}x${h}`,
+    `canvas ${canvas.clientWidth}x${canvas.clientHeight}`,
+    `画素比 ${window.devicePixelRatio}`,
+    `カメラ ${cam}`,
+    `半径 ${Number(radius.toPrecision(4))}`,
+    gl.isContextLost() ? 'コンテキスト喪失（イベントなし）' : '',
+    err ? `glError ${err}` : '',
+  ].filter(Boolean).join(' / ');
+  if (reason !== '定期' || line !== lastProbe) {
+    lastProbe = line;
+    log(`描画の確認（${reason}・前回の描画から ${Math.round(sinceLast)}ms）: ${line}`);
+  }
+}
+
+setInterval(() => {
+  if (document.visibilityState !== 'visible') {
+    return;
+  }
+  const gap = performance.now() - lastFrameAt;
+  if (gap > RAF_GAP_LOG_MS) {
+    log(`描画ループが ${Math.round(gap)}ms 止まっている`);
+  }
+  if (config.periodicRedraw) {
+    requestProbe('定期');
+  }
+}, HEALTH_INTERVAL_MS);
+document.addEventListener('visibilitychange', () => {
+  log(`表示状態: ${document.visibilityState}`);
+  if (document.visibilityState === 'visible') {
+    requestProbe('表示');
+  }
+});
+window.addEventListener('focus', () => requestProbe('フォーカス'));
+
+// ディスプレイをまたいで画素比が変わったら、描画の解像度を合わせ直す
+function watchPixelRatio() {
+  const dpr = window.devicePixelRatio;
+  matchMedia(`(resolution: ${dpr}dppx)`).addEventListener(
+    'change',
+    () => {
+      log(`画素比が変わった: ${dpr} → ${window.devicePixelRatio}`);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      resize();
+      watchPixelRatio();
+    },
+    { once: true },
+  );
+}
+watchPixelRatio();
 
 // ---- 拡張ホストとのやり取り ----
 /** postMessage の直列化で形が変わっても Uint8Array に戻す（Buffer の JSON 形・数値キーのオブジェクトにも対応）*/
@@ -742,6 +858,7 @@ function tryLoad(data: Uint8Array, fit: boolean) {
     loadModel(data, fit);
   } catch (err) {
     ui.message.textContent = `モデルを解釈できませんでした: ${err instanceof Error ? err.message : err}`;
+    log(ui.message.textContent);
   }
 }
 
@@ -772,18 +889,23 @@ window.addEventListener('message', (event) => {
     case 'reload':
       ui.name.textContent = msg.name;
       if (msg.type === 'reload' && !receivedLoad) {
+        log('最初の load より前の reload を捨てた');
         break; // 最初の load より前に届いた再読込は捨てる（すぐ後に load が来る）
       }
       lastData = toBytes(msg.data);
+      log(`${msg.type} を受け取った: ${lastData.byteLength} バイト`);
       if (msg.type === 'load' && !receivedLoad) {
         receivedLoad = true;
         const saved = vscode.getState() as Partial<ViewState> | undefined;
         if (saved) {
           // 裏から戻って webview が作り直されたとき：前の視点と計測で再開する
           tryLoad(lastData, false);
-          if (hasModel && !restoreView(saved)) {
+          const restored = hasModel && restoreView(saved);
+          log(restored ? `視点を戻した: カメラ ${saved.camera?.join(',')} 注視点 ${saved.target?.join(',')}` : '視点を戻せず全体表示にした');
+          if (hasModel && !restored) {
             fitView();
           }
+          requestProbe('読み込み');
           break;
         }
       }
@@ -792,6 +914,10 @@ window.addEventListener('message', (event) => {
       }
       // 再読込では視点を保つ（形を直しながら同じ角度で見比べられるように）
       tryLoad(lastData, msg.type === 'load' || !hasModel);
+      requestProbe('読み込み');
+      break;
+    case 'probe':
+      requestProbe('手動');
       break;
     case 'error':
       ui.message.textContent = msg.message;
@@ -799,6 +925,16 @@ window.addEventListener('message', (event) => {
   }
 });
 
+{
+  const gl = renderer.getContext();
+  const info = gl.getExtension('WEBGL_debug_renderer_info');
+  const gpu = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : '不明';
+  const attrs = gl.getContextAttributes();
+  log(
+    `webview 起動: three r${THREE.REVISION} / ${gl.getParameter(gl.VERSION)} / GPU ${gpu} / 画素比 ${window.devicePixelRatio}` +
+      ` / canvas ${canvas.clientWidth}x${canvas.clientHeight} / 属性 ${JSON.stringify(attrs)}`,
+  );
+}
 resize();
 frame();
 vscode.postMessage({ type: 'ready' });

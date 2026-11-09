@@ -53,6 +53,10 @@
       {
         "command": "jpstlviewer.open",
         "title": "JP STL Viewer: STL / 3MF をプレビューで開く"
+      },
+      {
+        "command": "jpstlviewer.probe",
+        "title": "JP STL Viewer: 描画の状態をログに出す"
       }
     ],
     "menus": {
@@ -80,6 +84,11 @@
           "minimum": 0,
           "maximum": 1,
           "description": "モデルを床から浮かせる量（モデルの外接球の半径に対する割合）。大きさに比例するので、どの大きさのモデルでも同じ浮き具合に見える。0 で接地"
+        },
+        "jpstlviewer.periodicRedraw": {
+          "type": "boolean",
+          "default": true,
+          "description": "10 秒ごとに描き直す（3D が白いまま戻らない不具合の対策）。切ると白くなった状態が残るので、出力パネル「JP STL Viewer」のログと合わせて原因を調べやすい"
         }
       }
     }

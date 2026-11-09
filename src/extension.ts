@@ -29,14 +29,18 @@ interface Look {
 type FileLook = Pick<Look, 'material' | 'color' | 'useStlColor' | 'colorMap'>;
 
 export function activate(context: vscode.ExtensionContext) {
-  const provider = new StlPreviewProvider(context);
+  // 出力パネルの「JP STL Viewer」。3D が白くなる・消えるといった、後から再現しにくい不具合を追うためのログ
+  const log = vscode.window.createOutputChannel('JP STL Viewer', { log: true });
+  const provider = new StlPreviewProvider(context, log);
   context.subscriptions.push(
+    log,
     // retainContextWhenHidden は使わない。裏のタブまで WebGL コンテキストと GPU メモリを持ち続けると、
     // webview 全体で共有するコンテキスト数の上限やメモリ不足で、表のタブの 3D が消えることがある。
     // 裏に回ると webview は破棄され、戻ると作り直される（視点と計測は webview の state から戻す）
     vscode.window.registerCustomEditorProvider(VIEW_TYPE, provider, {
       supportsMultipleEditorsPerDocument: true,
     }),
+    vscode.commands.registerCommand('jpstlviewer.probe', () => provider.probeVisible()),
     vscode.commands.registerCommand('jpstlviewer.open', (uri?: vscode.Uri) => {
       const target = uri ?? vscode.window.activeTextEditor?.document.uri;
       if (!target) {
@@ -92,7 +96,26 @@ function isCompleteZip(data: Uint8Array): boolean {
 }
 
 class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  private panelCount = 0;
+  // 開いているパネル（コマンド「描画の状態をログに出す」で、表に出ているものに確認を頼むため）
+  private readonly panels = new Set<vscode.WebviewPanel>();
+
+  /** 表に出ているパネルに、描き直して画面の色をログに出すよう頼む */
+  probeVisible() {
+    const visible = [...this.panels].filter((p) => p.visible);
+    if (visible.length === 0) {
+      this.log.info('描画の確認: 表に出ている JP STL Viewer がない');
+    }
+    for (const p of visible) {
+      p.webview.postMessage({ type: 'probe' });
+    }
+    this.log.show(true);
+  }
+
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly log: vscode.LogOutputChannel,
+  ) {}
 
   openCustomDocument(uri: vscode.Uri): vscode.CustomDocument {
     return { uri, dispose: () => {} };
@@ -112,22 +135,40 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     // 新しい webview に届けない（届くと、戻したばかりの視点と計測を消してしまう）
     let generation = 0;
     let changedWhileHidden = false;
+    // ログの行頭に付ける「ファイル名#パネル番号」（同じファイルを複数開いても見分けられるように）
+    const tag = `${uri.path.split('/').pop()}#${++this.panelCount}`;
+    const log = (message: string) => this.log.info(`[${tag}] ${message}`);
+    log(`開いた: ${uri.fsPath}`);
+    this.panels.add(panel);
 
     const send = async (kind: 'load' | 'reload') => {
       const gen = generation;
       for (let attempt = 0; attempt <= RETRY_COUNT; attempt++) {
         if (disposed || gen !== generation) {
+          log(`${kind} を中断（webview が替わった: 世代 ${gen} → ${generation}）`);
           return;
         }
         try {
           const data = await vscode.workspace.fs.readFile(uri);
           if (gen !== generation) {
+            log(`${kind} を破棄（読んでいる間に webview が替わった: 世代 ${gen} → ${generation}）`);
             return;
           }
-          if (isCompleteFile(data) || attempt === RETRY_COUNT) {
+          const complete = isCompleteFile(data);
+          if (complete || attempt === RETRY_COUNT) {
             // readFile は Node の Buffer を返す。Buffer は toJSON を持つので、そのまま送ると
             // {type:'Buffer', data:[…]} に化ける。素の Uint8Array に写してから送る
-            panel.webview.postMessage({ type: kind, name: uri.path.split('/').pop(), data: new Uint8Array(data) });
+            // 送信の失敗は読み直しで取り戻さない（catch に落ちると同じものを二度送ってしまう）
+            const delivered = await panel.webview
+              .postMessage({ type: kind, name: uri.path.split('/').pop(), data: new Uint8Array(data) })
+              .then(
+                (ok) => ok,
+                (e) => {
+                  log(`${kind} の送信で例外: ${e}`);
+                  return false;
+                },
+              );
+            log(`${kind} を送った: ${data.byteLength} バイト・${attempt + 1} 回目${complete ? '' : '（不完全なまま）'}・世代 ${gen}${delivered ? '' : '・届かず'}`);
             return;
           }
         } catch (err) {
@@ -135,6 +176,7 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
             return;
           }
           if (attempt === RETRY_COUNT) {
+            log(`読み込みに失敗: ${err}`);
             panel.webview.postMessage({ type: 'error', message: `読み込みに失敗しました: ${err}` });
             return;
           }
@@ -171,9 +213,13 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
 
     panel.webview.onDidReceiveMessage((msg) => {
       switch (msg.type) {
+        case 'log':
+          log(`webview: ${msg.message}`);
+          break;
         case 'ready':
           ready = true;
           generation++;
+          log(`ready（世代 ${generation}）`);
           changedWhileHidden = false;
           clearTimeout(timer);
           panel.webview.postMessage({
@@ -195,9 +241,11 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
         case 'reinit':
           // GPU の描画が戻らない。HTML を入れ直して webview を作り直す（作り直した側がまた ready を送ってくる）
           if (Date.now() - lastReinit < REINIT_MIN_INTERVAL_MS) {
+            log('reinit を断った（前回から間がない）');
             panel.webview.postMessage({ type: 'error', message: 'GPU の描画が戻りません。タブを閉じて開き直してください' });
             break;
           }
+          log('reinit: webview を作り直す');
           lastReinit = Date.now();
           ready = false;
           generation++;
@@ -210,7 +258,12 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
 
     // 裏に回ると webview はふつう破棄され、戻ると作り直されて ready → load で読み直す。
     // 破棄されなかった場合に備え、隠れている間の変更は表に戻ったときに読み直す
+    let wasVisible = panel.visible;
     panel.onDidChangeViewState(() => {
+      if (panel.visible !== wasVisible) {
+        wasVisible = panel.visible;
+        log(panel.visible ? '表に出た' : '裏に回った');
+      }
       if (!panel.visible) {
         clearTimeout(timer);
         generation++;
@@ -221,6 +274,8 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     });
 
     panel.onDidDispose(() => {
+      log('閉じた');
+      this.panels.delete(panel);
       disposed = true;
       clearTimeout(timer);
       watcher.dispose();
@@ -278,6 +333,7 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     return {
       creaseAngle: c.get<number>('creaseAngle', 30),
       floatRatio: c.get<number>('floatRatio', 0.05),
+      periodicRedraw: c.get<boolean>('periodicRedraw', true),
     };
   }
 
