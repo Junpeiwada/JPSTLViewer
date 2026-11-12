@@ -1,7 +1,7 @@
 {
   "name": "jpstlviewer",
   "displayName": "JP STL Viewer",
-  "description": "STL / 3MF を PBR（環境光 IBL・ソフトシャドウ・AO）で高品位にリアルタイムプレビューする VSCode 拡張。材質プリセットつき、ファイルの更新で自動リロード。",
+  "description": "STL / 3MF / KiCad 基板（.kicad_pcb）を PBR（環境光 IBL・ソフトシャドウ・AO）で高品位にリアルタイムプレビューする VSCode 拡張。材質プリセットつき、ファイルの更新で自動リロード。",
   "version": "0.4.2",
   "publisher": "junpeiwada",
   "icon": "images/icon.png",
@@ -21,6 +21,8 @@
   "keywords": [
     "stl",
     "3mf",
+    "kicad",
+    "pcb",
     "3d",
     "3d printing",
     "preview",
@@ -47,12 +49,27 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "jpstlviewer.pcbPreview",
+        "displayName": "JP STL Viewer（KiCad 基板）",
+        "selector": [
+          {
+            "filenamePattern": "*.kicad_pcb"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "commands": [
       {
         "command": "jpstlviewer.open",
-        "title": "JP STL Viewer: STL / 3MF をプレビューで開く"
+        "title": "JP STL Viewer: STL / 3MF / KiCad 基板をプレビューで開く"
+      },
+      {
+        "command": "jpstlviewer.openInKicad",
+        "category": "JP STL Viewer",
+        "title": "KiCad で開く"
       },
       {
         "command": "jpstlviewer.probe",
@@ -63,7 +80,12 @@
       "explorer/context": [
         {
           "command": "jpstlviewer.open",
-          "when": "resourceExtname =~ /^\\.(stl|3mf)$/i",
+          "when": "resourceExtname =~ /^\\.(stl|3mf|kicad_pcb)$/i",
+          "group": "navigation"
+        },
+        {
+          "command": "jpstlviewer.openInKicad",
+          "when": "resourceExtname == .kicad_pcb",
           "group": "navigation"
         }
       ]
@@ -84,6 +106,12 @@
           "minimum": 0,
           "maximum": 1,
           "description": "モデルを床から浮かせる量（モデルの外接球の半径に対する割合）。大きさに比例するので、どの大きさのモデルでも同じ浮き具合に見える。0 で接地"
+        },
+        "jpstlviewer.kicadCliPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "kicad-cli（Windows は kicad-cli.exe）の絶対パス。ワークスペースの設定では変えられない。空なら PATH と KiCad の標準のインストール先から探す"
         },
         "jpstlviewer.periodicRedraw": {
           "type": "boolean",

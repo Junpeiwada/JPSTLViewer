@@ -185,6 +185,28 @@ body[data-theme='dark'] {
   gap: 6px;
 }
 
+#lights label[hidden] {
+  display: none;
+}
+
+/* 「レジストの濃さ」は文字が長いので、ほかの行より見出しの列を広げる */
+#lights #maskRow {
+  grid-template-columns: auto 90px 3em;
+}
+
+#layerList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#layerList label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
 #lights output {
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -343,4 +365,89 @@ body[data-theme='dark'] #measure {
 #measure .axes {
   font-size: 10px;
   font-weight: 400;
+}
+
+/* 基板のとき、ツールバーを右端まで伸ばして「KiCad で開く」を右に寄せる */
+#panel.pcb {
+  right: 12px;
+}
+
+#openKicad {
+  margin-left: auto;
+}
+
+/* 下の帯の状態表示（書き出し中など） */
+#status {
+  color: #3b6fd8;
+}
+
+body[data-theme='dark'] #status {
+  color: #7aa2f7;
+}
+
+/* 書き出しの進み具合（前回の時間からの見込み） */
+#progress {
+  display: inline-block;
+  width: 96px;
+  height: 4px;
+  overflow: hidden;
+  background: var(--border);
+  border-radius: 2px;
+}
+
+#progress[hidden] {
+  display: none;
+}
+
+#progress i {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: #3b6fd8;
+  transition: width 0.25s linear;
+}
+
+body[data-theme='dark'] #progress i {
+  background: #7aa2f7;
+}
+
+/* KiCad が無いときの案内。中央の赤字（#message）とは別の要素 */
+#kicadNotice {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 320px;
+  padding: 16px 20px;
+  color: var(--fg);
+  text-align: center;
+  background: var(--panel);
+  border: 2px solid #d93025;
+  border-radius: 6px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+#kicadNotice[hidden] {
+  display: none;
+}
+
+#kicadNotice p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+#kicadNotice button {
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 12px;
+  cursor: pointer;
 }

@@ -11,3 +11,5 @@ images/**
 !images/icon.png
 **/__pycache__/**
 *.vsix
+temp/**
+_temp/**

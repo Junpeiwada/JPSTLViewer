@@ -12,6 +12,8 @@ export interface Look {
   fillLight: number;    // 床下からの補助光のモデル中心での照度
   envLight: number;     // 環境光（IBL）の強さ
   camLight: number;     // カメラに付けた弱い点光源の注視点での照度
+  hiddenLayers?: string[]; // 隠した層の key（KiCad 基板。ファイルごと）
+  maskOpacity: number;  // 重ねる層（KiCad 基板のレジスト）の不透明度。全ファイル共通
 }
 
 /** ライトのスライダー（パネルの並び順） */
@@ -88,6 +90,7 @@ export const DEFAULT_LOOK: Look = {
   fillLight: 1.0,
   envLight: 0.3,
   camLight: 0.3,
+  maskOpacity: 0.6,
 };
 
 // プリセットを切り替えたときに前の材質の値（透過など）が残らないよう、毎回ここから戻す

@@ -1,4 +1,4 @@
-// STL / 3MF プレビューの webview 本体。
+// STL / 3MF / GLB（KiCad 基板）プレビューの webview 本体。
 // リアルタイム PBR（環境光 IBL・ソフトシャドウ・GTAO・MSAA）で描く。
 import * as THREE from 'three';
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
@@ -10,6 +10,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import { BACKGROUNDS, DEFAULT_LOOK, LIGHTS, Look, MATERIALS, applyMaterial } from './looks';
+import { isGlb, parseGlb, type GlbLayers, type GlbMesh } from './glb';
 import { Measure } from './measure';
 import { isZip, parse3mf } from './threemf';
 
@@ -61,6 +62,8 @@ document.body.insertAdjacentHTML(
   <button id="lightsBtn" title="ライトの強さを調整する">ライト</button>
   <button id="measureBtn" title="クリックした 2 点の間の長さを測る（M）。頂点の近くは頂点に吸着、Alt を押しながらで吸着しない">計測</button>
   <button id="measureClear" title="計測の線をすべて消す（Esc）" hidden>計測を消す</button>
+  <button id="layersBtn" title="基板の層（部品・シルク・銅など）を表示・非表示にする" hidden>層</button>
+  <button id="openKicad" title="この基板を KiCad の PCB エディタで開く" hidden>KiCad で開く</button>
 </div>
 <div id="colorPanel" class="popover" hidden>
   <div class="row"><input id="color" type="color"><input id="colorHex" type="text" maxlength="7" spellcheck="false"></div>
@@ -70,9 +73,18 @@ document.body.insertAdjacentHTML(
 </div>
 <div id="lights" class="popover" hidden>
   ${LIGHTS.map((l) => `<label title="${l.title}"><span>${l.label}</span><input id="${l.key}" type="range" min="0" max="${l.max}" step="0.05"><output id="${l.key}Val"></output></label>`).join('')}
+  <label id="maskRow" title="基板のレジスト（緑の半透明の層）の濃さ。下の銅の配線の見えやすさが変わる" hidden><span>レジストの濃さ</span><input id="maskOpacity" type="range" min="0" max="1" step="0.05"><output id="maskOpacityVal"></output></label>
   <button id="lightsReset">既定に戻す</button>
 </div>
-<div id="info"><span id="name"></span><span id="dims"></span></div>
+<div id="layers" class="popover" hidden>
+  <div id="layerList"></div>
+  <button id="layersAll" title="隠した層をすべて表示する">すべて表示</button>
+</div>
+<div id="info"><span id="name"></span><span id="dims"></span><span id="status"></span><span id="progress" hidden><i></i></span></div>
+<div id="kicadNotice" hidden>
+  <p id="kicadNoticeText"></p>
+  <button id="kicadDownload">ダウンロードページ</button>
+</div>
 <div id="message"></div>`,
 );
 
@@ -93,9 +105,22 @@ const ui = {
   copyColor: document.getElementById('copyColor') as HTMLButtonElement,
   lightsBtn: document.getElementById('lightsBtn') as HTMLButtonElement,
   lights: document.getElementById('lights') as HTMLElement,
+  maskRow: document.getElementById('maskRow') as HTMLElement,
   lightsReset: document.getElementById('lightsReset') as HTMLButtonElement,
   measureBtn: document.getElementById('measureBtn') as HTMLButtonElement,
   measureClear: document.getElementById('measureClear') as HTMLButtonElement,
+  layersBtn: document.getElementById('layersBtn') as HTMLButtonElement,
+  layers: document.getElementById('layers') as HTMLElement,
+  layerList: document.getElementById('layerList') as HTMLElement,
+  layersAll: document.getElementById('layersAll') as HTMLButtonElement,
+  openKicad: document.getElementById('openKicad') as HTMLButtonElement,
+  panel: document.getElementById('panel') as HTMLElement,
+  status: document.getElementById('status') as HTMLElement,
+  progress: document.getElementById('progress') as HTMLElement,
+  progressBar: document.querySelector('#progress i') as HTMLElement,
+  kicadNotice: document.getElementById('kicadNotice') as HTMLElement,
+  kicadNoticeText: document.getElementById('kicadNoticeText') as HTMLElement,
+  kicadDownload: document.getElementById('kicadDownload') as HTMLButtonElement,
   name: document.getElementById('name') as HTMLElement,
   dims: document.getElementById('dims') as HTMLElement,
   message: document.getElementById('message') as HTMLElement,
@@ -119,7 +144,8 @@ let config: Config = { ...DEFAULT_CONFIG };
 let look: Look = { ...DEFAULT_LOOK };
 let lastData: Uint8Array | null = null;
 let hasModel = false;
-let stlHasColors = false; // 読み込んだファイルに色が埋め込まれているか（STL はヘッダの COLOR=、3MF はフィラメント・材質）
+let stlHasColors = false; // 読み込んだファイルに色が埋め込まれているか（STL はヘッダの COLOR=、3MF はフィラメント・材質、GLB は材質の色）
+let layers: GlbLayers | null = null; // 読み込んだ基板の層の分け方（STL / 3MF は null）
 let palette: StlPalette | null = null; // 読み込んだファイルの色の一覧と、三角形ごとの色の番号
 let viewSaveTimer: ReturnType<typeof setTimeout> | undefined;
 let contextLost = false;
@@ -132,6 +158,7 @@ interface StlPalette {
   colors: string[];   // 元の色（"#rrggbb"。5 ビットの値を 8 ビットに広げたもの）
   shares: number[];   // 表面積に対する割合
   faceColor: Uint16Array;
+  overlayFaceColor: Uint16Array | null; // 重ねる層（半透明のレジストなど）の三角形ごとの色の番号。同じ colors を指す
 }
 
 /**
@@ -174,17 +201,27 @@ function readStlColors(data: Uint8Array): { colors: string[]; faceColor: Uint16A
 }
 
 /** 色ごとの表面積を測り、多い順に並べた色の一覧にする。positions は三角形ごとに 3 頂点 */
-function makePalette(colors: string[], raw: Uint16Array, positions: ArrayLike<number>): StlPalette {
+function makePalette(
+  colors: string[],
+  raw: Uint16Array,
+  positions: ArrayLike<number>,
+  overlay: { faceColor: Uint16Array; positions: ArrayLike<number> } | null,
+): StlPalette {
   const counts = new Array<number>(colors.length).fill(0); // 色ごとの表面積
   let total = 0;
-  for (let f = 0; f < raw.length; f++) {
-    const o = f * 9;
-    const ux = positions[o + 3] - positions[o], uy = positions[o + 4] - positions[o + 1], uz = positions[o + 5] - positions[o + 2];
-    const vx = positions[o + 6] - positions[o], vy = positions[o + 7] - positions[o + 1], vz = positions[o + 8] - positions[o + 2];
-    const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
-    total += area;
-    counts[raw[f]] += area;
-  }
+  // 本体と重ねる層の両方の三角形を数える（レジストの色も色パネルに出す）
+  const add = (face: Uint16Array, pos: ArrayLike<number>) => {
+    for (let f = 0; f < face.length; f++) {
+      const o = f * 9;
+      const ux = pos[o + 3] - pos[o], uy = pos[o + 4] - pos[o + 1], uz = pos[o + 5] - pos[o + 2];
+      const vx = pos[o + 6] - pos[o], vy = pos[o + 7] - pos[o + 1], vz = pos[o + 8] - pos[o + 2];
+      const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+      total += area;
+      counts[face[f]] += area;
+    }
+  };
+  add(raw, positions);
+  if (overlay) add(overlay.faceColor, overlay.positions);
   // 多い順に並べ直す（パネルの上ほど面積の大きい色）
   const order = counts.map((_, k) => k).sort((a, b) => counts[b] - counts[a]);
   const rank = new Uint16Array(counts.length);
@@ -193,6 +230,7 @@ function makePalette(colors: string[], raw: Uint16Array, positions: ArrayLike<nu
     colors: order.map((k) => colors[k]),
     shares: order.map((k) => counts[k] / Math.max(total, 1e-12)),
     faceColor: raw.map((k) => rank[k]),
+    overlayFaceColor: overlay && overlay.faceColor.map((k) => rank[k]),
   };
 }
 
@@ -208,14 +246,21 @@ function applyStlColors() {
   }
   const c = new THREE.Color();
   const linear = palette.colors.map((hex) => c.set(look.colorMap[hex] ?? hex).toArray() as number[]);
-  const arr = new Float32Array(palette.faceColor.length * 9);
-  palette.faceColor.forEach((k, f) => {
-    const [r, g, b] = linear[k];
-    for (let v = 0; v < 3; v++) {
-      arr.set([r, g, b], f * 9 + v * 3);
-    }
-  });
-  geom.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  const paint = (g: THREE.BufferGeometry, face: Uint16Array) => {
+    const arr = new Float32Array(face.length * 9);
+    face.forEach((k, f) => {
+      const [r, gg, b] = linear[k];
+      for (let v = 0; v < 3; v++) {
+        arr.set([r, gg, b], f * 9 + v * 3);
+      }
+    });
+    g.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  };
+  paint(geom, palette.faceColor);
+  const of = palette.overlayFaceColor;
+  if (of && overlay.geometry.attributes.position?.count === of.length * 3) {
+    paint(overlay.geometry, of);
+  }
   requestRaster();
 }
 
@@ -346,6 +391,15 @@ model.castShadow = true;
 model.receiveShadow = true;
 scene.add(model);
 
+// 重ねる層（半透明のレジストなど）。model の子にして、浮かせた位置がそのまま効くようにする。
+// 影は落とさず（半透明の膜が本体に影を作らない）、深度も書かない（下の銅が透けて見えるように）
+const overlayMat = new THREE.MeshPhysicalMaterial({ side: THREE.DoubleSide, transparent: true, depthWrite: false });
+const overlay = new THREE.Mesh(new THREE.BufferGeometry(), overlayMat);
+overlay.castShadow = false;
+overlay.receiveShadow = true;
+overlay.visible = false;
+model.add(overlay);
+
 // ---- 長さの計測（画面に重ねる定規）----
 const measure = new Measure(canvas, camera, model, () => {
   ui.measureBtn.classList.toggle('active', measure.active);
@@ -370,28 +424,49 @@ const loader = new STLLoader();
 let radius = 1;
 let lightDist = 1; // ライトからモデル中心までの距離（layoutScene で決める）
 
-/** 形と色を読む。3MF は ZIP なので先頭のバイトで見分ける（拡張子に頼らない） */
-function parseModel(data: Uint8Array): { geom: THREE.BufferGeometry; colors: { colors: string[]; faceColor: Uint16Array } | null } {
-  if (isZip(data)) {
-    const mesh = parse3mf(data);
+/** 形と色を読む。GLB（先頭が glTF）と 3MF（ZIP）は先頭のバイトで見分ける（拡張子に頼らない） */
+function parseModel(data: Uint8Array): {
+  geom: THREE.BufferGeometry;
+  colors: { colors: string[]; faceColor: Uint16Array } | null;
+  overlay: { geom: THREE.BufferGeometry; faceColor: Uint16Array; opacity: number } | null;
+  layers: GlbLayers | null;
+} {
+  // GLB は 3MF と同じ形（mm・Z 上向き・非インデックス・三角形ごとの色）で返るので、同じ組み立てでよい
+  const glb = isGlb(data);
+  if (glb || isZip(data)) {
+    const mesh = glb ? parseGlb(data) : parse3mf(data);
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
     geom.computeVertexNormals();
-    return { geom, colors: mesh.colors ? { colors: mesh.colors, faceColor: mesh.faceColor } : null };
+    // GLB のレジスト（BLEND の材質）は本体と別のジオメトリで重ねる
+    const ov = glb ? (mesh as GlbMesh).overlay : null;
+    let overlayGeom = null;
+    if (ov && mesh.colors) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(ov.positions, 3));
+      g.computeVertexNormals();
+      overlayGeom = { geom: g, faceColor: ov.faceColor, opacity: ov.opacity };
+    }
+    return { geom, colors: mesh.colors ? { colors: mesh.colors, faceColor: mesh.faceColor } : null,
+      overlay: overlayGeom,
+      layers: glb ? (mesh as GlbMesh).layers : null,
+    };
   }
   const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-  return { geom: loader.parse(buffer), colors: readStlColors(data) };
+  return { geom: loader.parse(buffer), colors: readStlColors(data), overlay: null, layers: null };
 }
 
 function loadModel(data: Uint8Array, fit: boolean) {
   const parsed = parseModel(data);
   let geom = parsed.geom;
   // build123d などの CAD や 3MF は Z 上向き、three は Y 上向き
-  geom.rotateX(-Math.PI / 2);
-  if (config.creaseAngle > 0) {
+  const orient = (g: THREE.BufferGeometry) => {
+    g.rotateX(-Math.PI / 2);
     // 曲面は法線を平均して滑らかに、折れ目は面法線のまま残す
-    geom = toCreasedNormals(geom, THREE.MathUtils.degToRad(config.creaseAngle));
-  }
+    return config.creaseAngle > 0 ? toCreasedNormals(g, THREE.MathUtils.degToRad(config.creaseAngle)) : g;
+  };
+  geom = orient(geom);
+  const overGeom = parsed.overlay ? orient(parsed.overlay.geom) : null;
   geom.computeBoundingBox();
   const box = geom.boundingBox!;
   const size = box.getSize(new THREE.Vector3());
@@ -399,15 +474,28 @@ function loadModel(data: Uint8Array, fit: boolean) {
   // 床（Y=0）に接地させ、XZ は原点中心に
   geom.translate(-center.x, -box.min.y, -center.z);
   geom.computeBoundingSphere();
+  // 重ねる層は本体の bbox で動かす（本体と同じ位置に重なるように）
+  overGeom?.translate(-center.x, -box.min.y, -center.z);
 
   model.geometry.dispose();
   model.geometry = geom;
+  overlay.geometry.dispose();
+  overlay.geometry = overGeom ?? new THREE.BufferGeometry();
+  overlay.visible = overGeom !== null;
   radius = Math.max(geom.boundingSphere!.radius, 1e-3);
   hasModel = true;
-  palette = parsed.colors && makePalette(parsed.colors.colors, parsed.colors.faceColor, geom.attributes.position.array);
+  palette = parsed.colors && makePalette(
+    parsed.colors.colors,
+    parsed.colors.faceColor,
+    geom.attributes.position.array,
+    parsed.overlay && overGeom && { faceColor: parsed.overlay.faceColor, positions: overGeom.attributes.position.array },
+  );
   stlHasColors = palette !== null;
+  layers = parsed.layers;
   applyStlColors();
   buildStlColorRows();
+  buildLayerRows();
+  applyLayerVisibility();
   applyLook();
 
   layoutScene();
@@ -419,6 +507,75 @@ function loadModel(data: Uint8Array, fit: boolean) {
   const tris = geom.attributes.position.count / 3;
   ui.dims.textContent = `${size.x.toFixed(2)} × ${size.z.toFixed(2)} × ${size.y.toFixed(2)} mm ・ ${tris.toLocaleString()} 三角形`;
   ui.message.textContent = '';
+  ui.kicadNotice.hidden = true; // モデルが読めたので KiCad の案内は要らない
+  requestRaster();
+}
+
+/** 隠してある層か（look.hiddenLayers は key で持つので、再読込で層の並びが変わっても効く） */
+function isLayerHidden(key: string) {
+  return !!look.hiddenLayers?.includes(key);
+}
+
+/** 層パネルのチェックボックスを作り直す。層が無い（STL / 3MF）ときはボタンごと隠す */
+function buildLayerRows() {
+  ui.layerList.replaceChildren();
+  ui.layersBtn.hidden = !layers;
+  if (!layers) {
+    ui.layers.hidden = true;
+    ui.layersBtn.classList.remove('active');
+    return;
+  }
+  for (const l of layers.list) {
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.dataset.key = l.key;
+    box.checked = !isLayerHidden(l.key);
+    box.addEventListener('change', () => {
+      const hidden = new Set(look.hiddenLayers ?? []);
+      if (box.checked) {
+        hidden.delete(l.key);
+      } else {
+        hidden.add(l.key);
+      }
+      setLook({ hiddenLayers: [...hidden] });
+      applyLayerVisibility();
+    });
+    const label = document.createElement('label');
+    label.append(box, ` ${l.label}`);
+    ui.layerList.append(label);
+  }
+}
+
+/** 隠した層の三角形を外すインデックスを本体と重ねる層に張る（ジオメトリは作り直さない）。何も隠さないときは外して元どおり */
+function applyLayerVisibility() {
+  const apply = (geom: THREE.BufferGeometry, faces: Uint8Array | null) => {
+    const count = geom.attributes.position?.count ?? 0;
+    // 三角形の数が合わない（想定外の並び）ときは、ずれた表示にならないよう全部見せる
+    if (!layers || !faces || faces.length * 3 !== count) {
+      geom.setIndex(null);
+      return;
+    }
+    const hide = layers.list.map((l) => isLayerHidden(l.key));
+    if (!hide.some(Boolean)) {
+      geom.setIndex(null);
+      return;
+    }
+    let shown = 0;
+    for (let t = 0; t < faces.length; t++) {
+      if (!hide[faces[t]]) shown++;
+    }
+    const index = new Uint32Array(shown * 3);
+    let o = 0;
+    for (let t = 0; t < faces.length; t++) {
+      if (hide[faces[t]]) continue;
+      index[o++] = t * 3;
+      index[o++] = t * 3 + 1;
+      index[o++] = t * 3 + 2;
+    }
+    geom.setIndex(new THREE.BufferAttribute(index, 1));
+  };
+  apply(model.geometry, layers?.face ?? null);
+  apply(overlay.geometry, layers?.overlayFace ?? null);
   requestRaster();
 }
 
@@ -484,6 +641,16 @@ function applyLook() {
   applyLights();
   const useStlColor = stlHasColors && look.useStlColor;
   applyMaterial(modelMat, look.material, look.color, useStlColor);
+  // 重ねる層も同じプリセット・同じ単色（半透明は材質の opacity で効く）
+  applyMaterial(overlayMat, look.material, look.color, useStlColor);
+  overlayMat.transparent = true;
+  overlayMat.depthWrite = false;
+  // 表の銅のベタとレジストは厚み方向に 15 µm しか違わず、全体表示の深度の分解能（12 µm 前後）では
+  // 銅が手前と判定されてレジストが消える。カメラ側へ寄せて描く（applyMaterial では触られないのでここで毎回入れる）
+  overlayMat.polygonOffset = true;
+  overlayMat.polygonOffsetFactor = -1;
+  overlayMat.polygonOffsetUnits = -4;
+  overlayMat.opacity = look.maskOpacity;
   const bg = BACKGROUNDS[look.background] ?? BACKGROUNDS[DEFAULT_LOOK.background];
   backgroundColor.set(bg.background);
   fog.color.set(bg.background); // Fog は色を複製して持つので、背景色とは別に更新する
@@ -512,6 +679,10 @@ function applyLook() {
     (document.getElementById(l.key) as HTMLInputElement).value = String(look[l.key]);
     (document.getElementById(`${l.key}Val`) as HTMLOutputElement).value = look[l.key].toFixed(2);
   }
+  // 濃さのスライダーは重ねる層があるとき（KiCad 基板）だけ出す
+  ui.maskRow.hidden = !overlay.visible;
+  (document.getElementById('maskOpacity') as HTMLInputElement).value = String(look.maskOpacity);
+  (document.getElementById('maskOpacityVal') as HTMLOutputElement).value = look.maskOpacity.toFixed(2);
   requestRaster();
 }
 
@@ -556,6 +727,7 @@ ui.copyColor.addEventListener('click', () => {
 const popovers: [HTMLButtonElement, HTMLElement][] = [
   [ui.colorBtn, ui.colorPanel],
   [ui.lightsBtn, ui.lights],
+  [ui.layersBtn, ui.layers],
 ];
 for (const [btn, pane] of popovers) {
   btn.addEventListener('click', () => {
@@ -572,6 +744,16 @@ for (const l of LIGHTS) {
   const input = document.getElementById(l.key) as HTMLInputElement;
   input.addEventListener('input', () => setLook({ [l.key]: Number(input.value) }));
 }
+(document.getElementById('maskOpacity') as HTMLInputElement).addEventListener('input', (e) =>
+  setLook({ maskOpacity: Number((e.target as HTMLInputElement).value) }),
+);
+ui.layersAll.addEventListener('click', () => {
+  setLook({ hiddenLayers: [] });
+  for (const box of Array.from(ui.layerList.querySelectorAll<HTMLInputElement>('input'))) {
+    box.checked = true;
+  }
+  applyLayerVisibility();
+});
 ui.lightsReset.addEventListener('click', () =>
   setLook({
     keyLight: DEFAULT_LOOK.keyLight,
@@ -582,6 +764,8 @@ ui.lightsReset.addEventListener('click', () =>
 );
 ui.measureBtn.addEventListener('click', () => measure.setActive(!measure.active));
 ui.measureClear.addEventListener('click', () => measure.clear());
+ui.openKicad.addEventListener('click', () => vscode.postMessage({ type: 'openInKicad' }));
+ui.kicadDownload.addEventListener('click', () => vscode.postMessage({ type: 'openKicadDownload' }));
 window.addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement) {
     return;
@@ -857,9 +1041,39 @@ function tryLoad(data: Uint8Array, fit: boolean) {
   try {
     loadModel(data, fit);
   } catch (err) {
+    ui.kicadNotice.hidden = true; // 赤字と案内カードが重ならないようにする
     ui.message.textContent = `モデルを解釈できませんでした: ${err instanceof Error ? err.message : err}`;
     log(ui.message.textContent);
   }
+}
+
+// 下の帯の状態表示。expectedMs があれば経過秒数と、前回の時間を目安にした進み具合のバーを出す。
+// kicad-cli は途中経過を出さないので、バーは見込み。前回の時間までに 9 割まで進め、超えたら 100% の手前でゆっくり近づける
+let statusTimer: ReturnType<typeof setInterval> | undefined;
+function setStatus(message: string, expectedMs?: number) {
+  if (statusTimer !== undefined) {
+    clearInterval(statusTimer);
+    statusTimer = undefined;
+  }
+  ui.status.textContent = message;
+  ui.progress.hidden = true;
+  if (!message) {
+    return;
+  }
+  const started = performance.now();
+  const expected = expectedMs && expectedMs > 0 ? expectedMs : undefined;
+  const tick = () => {
+    const elapsed = performance.now() - started;
+    const sec = Math.floor(elapsed / 1000);
+    ui.status.textContent = expected ? `${message} ${sec} 秒 / 前回 ${Math.round(expected / 1000)} 秒` : `${message} ${sec} 秒`;
+    if (expected) {
+      const ratio = elapsed < expected ? 0.9 * (elapsed / expected) : 0.9 + 0.09 * (1 - Math.exp(-(elapsed - expected) / expected));
+      ui.progressBar.style.width = `${(ratio * 100).toFixed(1)}%`;
+      ui.progress.hidden = false;
+    }
+  };
+  tick();
+  statusTimer = setInterval(tick, 250);
 }
 
 window.addEventListener('message', (event) => {
@@ -869,9 +1083,13 @@ window.addEventListener('message', (event) => {
       config = { ...DEFAULT_CONFIG, ...msg.config };
       look = { ...DEFAULT_LOOK, ...(msg.look ?? {}) };
       look.colorMap = { ...(look.colorMap ?? {}) };
+      look.hiddenLayers = [...(look.hiddenLayers ?? [])];
       if (!MATERIALS[look.material]) {
         look.material = DEFAULT_LOOK.material;
       }
+      // 「KiCad で開く」は基板のときだけ。ツールバーは右端まで伸ばしてボタンを右に寄せる
+      ui.openKicad.hidden = !msg.isPcb;
+      ui.panel.classList.toggle('pcb', !!msg.isPcb);
       applyLook();
       break;
     case 'config': {
@@ -920,7 +1138,20 @@ window.addEventListener('message', (event) => {
       requestProbe('手動');
       break;
     case 'error':
+      ui.kicadNotice.hidden = true; // 赤字と案内カードが重ならないようにする
       ui.message.textContent = msg.message;
+      break;
+    case 'status':
+      setStatus(msg.message, msg.expectedMs);
+      break;
+    case 'kicadMissing':
+      // 案内カードと赤字が同時に出ると混乱するので、赤字は消す
+      ui.message.textContent = '';
+      setStatus(''); // 帯の「書き出し中…」を残さない
+      ui.kicadNoticeText.textContent = msg.reason === 'tooOld'
+        ? `KiCad ${msg.version ? `${msg.version} ` : ''}は GLB を書き出せません。KiCad 8 以降に更新してください`
+        : 'KiCad が見つかりません。KiCad をインストールしてください';
+      ui.kicadNotice.hidden = false;
       break;
   }
 });
