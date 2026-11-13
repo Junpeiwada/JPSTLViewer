@@ -359,7 +359,7 @@ function bakeEnvironment() {
 bakeEnvironment();
 
 // 背景は単色。床は霧で背景色に溶かし、床の縁（地平線）を見せない
-const backgroundColor = new THREE.Color();
+const backgroundColor = new THREE.Color(BACKGROUNDS[DEFAULT_LOOK.background].background); // 見た目が届く前に塗っても黒くならないように
 scene.background = backgroundColor;
 const fog = new THREE.Fog(backgroundColor, 1, 2);
 scene.fog = fog;
@@ -911,8 +911,18 @@ function frame() {
   }
   lastFrameAt = now;
   controls.update();
-  if (!hasModel || contextLost) {
+  if (contextLost) {
     return; // 失っている間は描かない（汚れた印を残し、復帰後に描く）
+  }
+  if (!hasModel) {
+    // canvas は不透明（alpha: false）なので、一度も描かないと黒く見える。読み込みを待つ間は背景色で塗っておく
+    if (rasterDirty || now < keepDrawingUntil) {
+      renderer.setRenderTarget(null);
+      renderer.setClearColor(backgroundColor, 1);
+      renderer.clear();
+      rasterDirty = false;
+    }
+    return; // 汚れた印は読み込み後に loadModel が立て直す
   }
   measure.updateHover();
   if (rasterDirty || now < keepDrawingUntil) {
