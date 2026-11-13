@@ -505,12 +505,13 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
           break;
         case 'reinit':
           // GPU の描画が戻らない。HTML を入れ直して webview を作り直す（作り直した側がまた ready を送ってくる）
-          if (Date.now() - lastReinit < REINIT_MIN_INTERVAL_MS) {
+          // 間隔の制限は自動の作り直しが繰り返すのを止めるためのもの。ボタンから頼まれたときは制限しない
+          if (!msg.manual && Date.now() - lastReinit < REINIT_MIN_INTERVAL_MS) {
             log('reinit を断った（前回から間がない）');
             panel.webview.postMessage({ type: 'error', message: 'GPU の描画が戻りません。タブを閉じて開き直してください' });
             break;
           }
-          log('reinit: webview を作り直す');
+          log(`reinit: webview を作り直す${msg.manual ? '（ボタンから）' : ''}`);
           lastReinit = Date.now();
           ready = false;
           generation++;

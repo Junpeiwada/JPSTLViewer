@@ -64,6 +64,7 @@ document.body.insertAdjacentHTML(
   <button id="measureClear" title="計測の線をすべて消す（Esc）" hidden>計測を消す</button>
   <button id="layersBtn" title="基板の層（部品・シルク・銅など）を表示・非表示にする" hidden>層</button>
   <button id="openKicad" title="この基板を KiCad の PCB エディタで開く" hidden>KiCad で開く</button>
+  <button id="rebuild" title="3D が表示されないときに、表示部分（webview と canvas）を作り直す。タブを開き直すのと同じ。視点と計測は残る">作り直す</button>
 </div>
 <div id="colorPanel" class="popover" hidden>
   <div class="row"><input id="color" type="color"><input id="colorHex" type="text" maxlength="7" spellcheck="false"></div>
@@ -102,6 +103,7 @@ const ui = {
   stlColorWrap: document.getElementById('stlColorWrap') as HTMLElement,
   background: document.getElementById('background') as HTMLSelectElement,
   fit: document.getElementById('fit') as HTMLButtonElement,
+  rebuild: document.getElementById('rebuild') as HTMLButtonElement,
   copyColor: document.getElementById('copyColor') as HTMLButtonElement,
   lightsBtn: document.getElementById('lightsBtn') as HTMLButtonElement,
   lights: document.getElementById('lights') as HTMLElement,
@@ -321,7 +323,10 @@ function syncStlColorRows() {
 }
 
 // ---- レンダラ ----
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+// 「描けているのに画面に出ない（背景だけに見える）」対策:
+// alpha: false で canvas を不透明にし、透けて後ろが見える余地をなくす（後ろの縞が見えたら合成の問題と言い切れる）。
+// preserveDrawingBuffer: true で、合成側が絵を取り直しに来ても最後に描いた絵が残っているようにする
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false, preserveDrawingBuffer: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 // PBR Neutral はフィラメントの色を崩さずにハイライトだけ丸める（ACES ほど彩度が落ちない）
 renderer.toneMapping = THREE.NeutralToneMapping;
@@ -711,6 +716,12 @@ ui.colorHex.addEventListener('blur', () => (ui.colorHex.value = look.color));
 ui.stlColor.addEventListener('change', () => setLook({ useStlColor: ui.stlColor.checked }));
 ui.background.addEventListener('change', () => setLook({ background: ui.background.value }));
 ui.fit.addEventListener('click', fitView);
+ui.rebuild.addEventListener('click', () => {
+  // 描けているのに画面に出ないときは、タブを開き直すと直る。それと同じく webview ごと作り直してもらう
+  saveViewNow(); // 作り直した側が state から視点と計測を戻す
+  log('手動で作り直しを頼んだ');
+  vscode.postMessage({ type: 'reinit', manual: true });
+});
 ui.copyColor.addEventListener('click', () => {
   // webview からはクリップボードに書けないことがあるので、拡張側に書かせる
   if (stlHasColors && look.useStlColor && palette) {
@@ -858,6 +869,7 @@ function resize() {
   camera.updateProjectionMatrix();
   controls.handleResize();
   onCameraChange();
+  keepDrawing();
 }
 new ResizeObserver(resize).observe(canvas);
 
@@ -903,7 +915,7 @@ function frame() {
     return; // 失っている間は描かない（汚れた印を残し、復帰後に描く）
   }
   measure.updateHover();
-  if (rasterDirty) {
+  if (rasterDirty || now < keepDrawingUntil) {
     const sinceLast = now - lastRasterAt;
     composer.render();
     lastRasterAt = now;
@@ -932,7 +944,19 @@ let lastProbe = '';
 let lastFrameAt = performance.now();
 let lastRasterAt = performance.now();
 
+// 表示・読み込み・フォーカス・大きさの変化のあと、しばらく毎フレーム描く。
+// webview が表に出た直後は、最初の 1 枚が画面に合成されずに捨てられることがあり、
+// 変化があったときだけ描く作りだとそのまま背景だけの画面が残るため
+const KEEP_DRAWING_MS = 2000;
+let keepDrawingUntil = 0;
+function keepDrawing() {
+  keepDrawingUntil = performance.now() + KEEP_DRAWING_MS;
+}
+
 function requestProbe(reason: ProbeReason) {
+  if (reason !== '定期') {
+    keepDrawing();
+  }
   if (!hasModel || contextLost) {
     if (reason === '手動') {
       log(`描画の確認: できない（${!hasModel ? 'モデルが無い' : 'コンテキスト喪失中'}）`);
@@ -955,7 +979,7 @@ function probe(reason: ProbeReason, sinceLast: number) {
   const pixel = (x: number, y: number) => {
     const b = new Uint8Array(4);
     gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b);
-    return `${b[0]},${b[1]},${b[2]}`;
+    return `${b[0]},${b[1]},${b[2]},${b[3]}`; // 4 つ目は alpha（255 でないと透けている）
   };
   const center = pixel(w >> 1, h >> 1);
   const corner = pixel(Math.min(4, w - 1), Math.max(0, h - 5)); // readPixels の y は下から
