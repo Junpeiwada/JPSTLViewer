@@ -93,8 +93,8 @@ npm run publish
 2. organization（`junpeiwada.visualstudio.com`）を選び、`https://dev.azure.com/junpeiwada/_usersSettings/tokens` を開く
 3. **New Token** で以下を設定:
    - **Scopes**: 「Show all scopes」をクリック → **Marketplace** → **Manage** にチェック（これが必須。付け忘れると `Access Denied ... View user permissions` エラー）
-   - **Organization**: `All accessible organizations`（※ 2026年12月1日以降は非対応予定。個別 org スコープ + Marketplace Manage でも可）
-   - **Expiration**: 90日〜1年
+   - **Organization**: `junpeiwada`（1 つに絞る。`All accessible organizations` の全組織向けトークンは 2026年12月1日で使えなくなる。2026-11-12 に junpeiwada だけのトークンで公開できることを確かめた）
+   - **Expiration**: `Custom defined` にして 1 年先（既定の 30 days だとすぐ切れる）
 4. 生成されたトークンをコピー（この画面を閉じると二度と表示されない）
 
 ### トークンの使い方
@@ -121,7 +121,7 @@ PAT は有効期限（90日〜最長1年）が切れると公開時に `401` や
 
 1. https://dev.azure.com/junpeiwada/_usersSettings/tokens を開く
    - もし `signup.azure.com`（カード登録画面）に飛ばされたら、先に https://aex.dev.azure.com/me → `junpeiwada.visualstudio.com` から入り直す
-2. 一覧から `vsce-publish` トークンにチェックを入れる
+2. 一覧から `vsce-publish` トークンにチェックを入れる（全組織向けで作った古いトークンは Regenerate が押せない。そのときは下の「作り直す」へ）
 3. 上部の **Regenerate** をクリック → 新しい有効期限を設定（90日など）
 4. 表示された新しいトークン文字列をコピー（画面を閉じると二度と見えない）
 5. 新トークンで再ログイン:
