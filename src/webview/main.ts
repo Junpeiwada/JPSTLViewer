@@ -3,16 +3,16 @@
 import * as THREE from 'three';
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import { BACKGROUNDS, DEFAULT_LOOK, LIGHTS, Look, MATERIALS, applyMaterial } from './looks';
-import { isGlb, parseGlb, type GlbLayers, type GlbMesh } from './glb';
+import parseWorkerCode from 'parse-worker-code';
+import type { GlbLayers } from './glb';
 import { Measure } from './measure';
-import { isZip, parse3mf } from './threemf';
+import { fromGeomData, parseModel, type ParsedModel } from './parse';
+import type { ParseRequest } from './parseWorker';
 
 declare function acquireVsCodeApi(): { postMessage(msg: unknown): void; getState(): unknown; setState(state: unknown): void };
 const vscode = acquireVsCodeApi();
@@ -86,6 +86,13 @@ document.body.insertAdjacentHTML(
   <p id="kicadNoticeText"></p>
   <button id="kicadDownload">ダウンロードページ</button>
 </div>
+<div id="loading" hidden>
+  <div class="dots"><i></i><i></i><i></i></div>
+  <div id="loadingText"></div>
+  <div id="loadingName"></div>
+  <div id="loadingTime"></div>
+  <span id="loadingBar" hidden><i></i></span>
+</div>
 <div id="message"></div>`,
 );
 
@@ -126,10 +133,17 @@ const ui = {
   name: document.getElementById('name') as HTMLElement,
   dims: document.getElementById('dims') as HTMLElement,
   message: document.getElementById('message') as HTMLElement,
+  loading: document.getElementById('loading') as HTMLElement,
+  loadingText: document.getElementById('loadingText') as HTMLElement,
+  loadingName: document.getElementById('loadingName') as HTMLElement,
+  loadingTime: document.getElementById('loadingTime') as HTMLElement,
+  loadingBar: document.getElementById('loadingBar') as HTMLElement,
+  loadingBarFill: document.querySelector('#loadingBar i') as HTMLElement,
 };
 
 // 例外で黙って真っ白にならないよう、捕まえ損ねたエラーは画面に出す
 const showError = (err: unknown) => {
+  // 読み込み中の表示は消さない（読み込みの失敗は tryLoad と 'error' が消す。無関係な例外なら解析はそのまま続く）
   ui.message.textContent = `エラー: ${err instanceof Error ? err.message : String(err)}`;
   log(`エラー: ${err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err)}`);
 };
@@ -161,45 +175,6 @@ interface StlPalette {
   shares: number[];   // 表面積に対する割合
   faceColor: Uint16Array;
   overlayFaceColor: Uint16Array | null; // 重ねる層（半透明のレジストなど）の三角形ごとの色の番号。同じ colors を指す
-}
-
-/**
- * バイナリ STL の色（STLLoader と同じ解釈）を読み、色の一覧と三角形ごとの番号を返す。色が無ければ null。
- * ヘッダの COLOR= ＋ RGBA が既定色、三角形ごとの予備 2 バイトの最上位ビットが 0 なら r | g<<5 | b<<10（各 5 ビット）の固有色
- */
-function readStlColors(data: Uint8Array): { colors: string[]; faceColor: Uint16Array } | null {
-  if (data.byteLength < 84) {
-    return null;
-  }
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const faces = view.getUint32(80, true);
-  if (84 + faces * 50 !== data.byteLength) {
-    return null; // ASCII STL には色が無い
-  }
-  let defaultHex: string | null = null;
-  for (let i = 0; i < 80 - 10; i++) {
-    if (view.getUint32(i, false) === 0x434f4c4f && view.getUint8(i + 4) === 0x52 && view.getUint8(i + 5) === 0x3d) {
-      defaultHex = hex8(view.getUint8(i + 6), view.getUint8(i + 7), view.getUint8(i + 8));
-    }
-  }
-  if (defaultHex === null) {
-    return null;
-  }
-  const index = new Map<string, number>();
-  const raw = new Uint16Array(faces);
-  for (let f = 0; f < faces; f++) {
-    const packed = view.getUint16(84 + f * 50 + 48, true);
-    const hex = (packed & 0x8000) === 0
-      ? hex8(...([0, 5, 10].map((s) => Math.round((((packed >> s) & 0x1f) * 255) / 31)) as [number, number, number]))
-      : defaultHex;
-    let k = index.get(hex);
-    if (k === undefined) {
-      k = index.size;
-      index.set(hex, k);
-    }
-    raw[f] = k;
-  }
-  return { colors: [...index.keys()], faceColor: raw };
 }
 
 /** 色ごとの表面積を測り、多い順に並べた色の一覧にする。positions は三角形ごとに 3 頂点 */
@@ -234,10 +209,6 @@ function makePalette(
     faceColor: raw.map((k) => rank[k]),
     overlayFaceColor: overlay && overlay.faceColor.map((k) => rank[k]),
   };
-}
-
-function hex8(r: number, g: number, b: number): string {
-  return `#${[r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
 }
 
 /** 色の置き換え（look.colorMap）を反映して、頂点色を塗り直す */
@@ -425,53 +396,13 @@ composer.addPass(gtao);
 composer.addPass(new OutputPass());
 
 // ---- STL / 3MF の読み込みと配置 ----
-const loader = new STLLoader();
 let radius = 1;
 let lightDist = 1; // ライトからモデル中心までの距離（layoutScene で決める）
 
-/** 形と色を読む。GLB（先頭が glTF）と 3MF（ZIP）は先頭のバイトで見分ける（拡張子に頼らない） */
-function parseModel(data: Uint8Array): {
-  geom: THREE.BufferGeometry;
-  colors: { colors: string[]; faceColor: Uint16Array } | null;
-  overlay: { geom: THREE.BufferGeometry; faceColor: Uint16Array; opacity: number } | null;
-  layers: GlbLayers | null;
-} {
-  // GLB は 3MF と同じ形（mm・Z 上向き・非インデックス・三角形ごとの色）で返るので、同じ組み立てでよい
-  const glb = isGlb(data);
-  if (glb || isZip(data)) {
-    const mesh = glb ? parseGlb(data) : parse3mf(data);
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
-    geom.computeVertexNormals();
-    // GLB のレジスト（BLEND の材質）は本体と別のジオメトリで重ねる
-    const ov = glb ? (mesh as GlbMesh).overlay : null;
-    let overlayGeom = null;
-    if (ov && mesh.colors) {
-      const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.BufferAttribute(ov.positions, 3));
-      g.computeVertexNormals();
-      overlayGeom = { geom: g, faceColor: ov.faceColor, opacity: ov.opacity };
-    }
-    return { geom, colors: mesh.colors ? { colors: mesh.colors, faceColor: mesh.faceColor } : null,
-      overlay: overlayGeom,
-      layers: glb ? (mesh as GlbMesh).layers : null,
-    };
-  }
-  const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-  return { geom: loader.parse(buffer), colors: readStlColors(data), overlay: null, layers: null };
-}
-
-function loadModel(data: Uint8Array, fit: boolean) {
-  const parsed = parseModel(data);
-  let geom = parsed.geom;
-  // build123d などの CAD や 3MF は Z 上向き、three は Y 上向き
-  const orient = (g: THREE.BufferGeometry) => {
-    g.rotateX(-Math.PI / 2);
-    // 曲面は法線を平均して滑らかに、折れ目は面法線のまま残す
-    return config.creaseAngle > 0 ? toCreasedNormals(g, THREE.MathUtils.degToRad(config.creaseAngle)) : g;
-  };
-  geom = orient(geom);
-  const overGeom = parsed.overlay ? orient(parsed.overlay.geom) : null;
+/** 解析済みの形（parse.ts。向きと法線は直してある）を画面に置く */
+function loadModel(parsed: ParsedModel, fit: boolean) {
+  const geom = fromGeomData(parsed.geom);
+  const overGeom = parsed.overlay ? fromGeomData(parsed.overlay.geom) : null;
   geom.computeBoundingBox();
   const box = geom.boundingBox!;
   const size = box.getSize(new THREE.Vector3());
@@ -1070,27 +1001,142 @@ function toBytes(data: unknown): Uint8Array {
   throw new Error('ファイルのデータを受け取れませんでした');
 }
 
-/** 読めないファイルでも画面が止まらないよう、失敗は画面に出す */
-function tryLoad(data: Uint8Array, fit: boolean) {
+// ---- 解析（Worker）----
+// 解析は Worker（parseWorker.ts）で走らせ、画面を固めない。Worker を作れない（古い HTML の CSP など）ときはメインで解析する
+let worker: Worker | null | undefined; // undefined は未作成、null は使えない
+let pendingParse: { id: number; resolve: (m: ParsedModel | null) => void; reject: (e: Error) => void; data: Uint8Array } | null = null;
+let parseSeq = 0; // 最後に頼んだ解析の番号。これより古い結果は捨てる
+let workerUrl: string | undefined; // Worker の JS の blob。追い越しで作り直すたびに作らないよう使い回す
+
+function createWorker(): Worker | null {
   try {
-    loadModel(data, fit);
+    workerUrl ??= URL.createObjectURL(new Blob([parseWorkerCode], { type: 'text/javascript' }));
+    const w = new Worker(workerUrl);
+    w.onmessage = (e: MessageEvent<{ id: number; model?: ParsedModel; error?: string }>) => {
+      const p = pendingParse;
+      if (!p || p.id !== e.data.id) {
+        return;
+      }
+      pendingParse = null;
+      if (e.data.model) {
+        p.resolve(e.data.model);
+      } else {
+        p.reject(new Error(e.data.error ?? '不明なエラー'));
+      }
+    };
+    w.onerror = (e) => {
+      // 起動できなかった（CSP で止められた等）か、Worker の中で捕まえ損ねた。以後はメインで解析する
+      e.preventDefault();
+      if (worker !== w) {
+        return; // 作り直す前の古い Worker のもの。今の Worker と解析中の頼みには関係ない
+      }
+      log(`解析の Worker が使えない: ${e.message || '起動できなかった'}。メインスレッドで解析する`);
+      w.terminate();
+      worker = null;
+      const p = pendingParse;
+      pendingParse = null;
+      if (p) {
+        parseOnMain(p.data).then(p.resolve, p.reject);
+      }
+    };
+    return w;
   } catch (err) {
-    ui.kicadNotice.hidden = true; // 赤字と案内カードが重ならないようにする
-    ui.message.textContent = `モデルを解釈できませんでした: ${err instanceof Error ? err.message : err}`;
-    log(ui.message.textContent);
+    log(`解析の Worker を作れない: ${err instanceof Error ? err.message : err}。メインスレッドで解析する`);
+    return null;
   }
 }
 
-// 下の帯の状態表示。expectedMs があれば経過秒数と、前回の時間を目安にした進み具合のバーを出す。
+/** メインスレッドで解析する。先に一度描かせて、読み込み中の表示を出してから固まる */
+async function parseOnMain(data: Uint8Array): Promise<ParsedModel> {
+  await new Promise<void>((r) => {
+    const t = setTimeout(r, 100); // 裏に回っていて rAF が来ないときも進める
+    requestAnimationFrame(() => setTimeout(() => (clearTimeout(t), r()), 0));
+  });
+  return parseModel(data, config.creaseAngle);
+}
+
+/** 解析する。もっと新しい解析を頼まれて捨てられたら null */
+function parse(id: number, data: Uint8Array): Promise<ParsedModel | null> {
+  if (worker === undefined) {
+    worker = createWorker();
+  }
+  if (pendingParse) {
+    // 前の解析はもう要らない。Worker ごと止めて作り直す（重い解析を最後まで待たない）
+    pendingParse.resolve(null);
+    pendingParse = null;
+    worker?.terminate();
+    worker = createWorker();
+  }
+  if (!worker) {
+    return parseOnMain(data);
+  }
+  const w = worker;
+  return new Promise((resolve, reject) => {
+    pendingParse = { id, resolve, reject, data };
+    // lastData は設定の変更で解析し直すのに残すので、写しを手渡す
+    const copy = data.slice();
+    const req: ParseRequest = { id, data: copy, creaseAngle: config.creaseAngle };
+    w.postMessage(req, [copy.buffer]);
+  });
+}
+
+/**
+ * 解析して画面に置く。読めないファイルでも画面が止まらないよう、失敗は画面に出す。
+ * 新しい読み込みに追い越されたら 'superseded'（画面は新しい方が更新する）
+ */
+async function tryLoad(data: Uint8Array, fit: boolean): Promise<'done' | 'failed' | 'superseded'> {
+  const id = ++parseSeq;
+  // モデルが無いときは中央に段階を出す。再読込はモデルを出したまま、時間がかかったときだけ下の帯に出す
+  let slowTimer: ReturnType<typeof setTimeout> | undefined;
+  if (hasModel) {
+    slowTimer = setTimeout(() => setStatus(PARSING), RELOAD_STATUS_DELAY_MS);
+  } else {
+    setStatus(PARSING);
+  }
+  const started = performance.now();
+  try {
+    const parsed = await parse(id, data);
+    if (parsed === null || id !== parseSeq) {
+      return 'superseded';
+    }
+    loadModel(parsed, fit);
+    log(`解析と配置: ${Math.round(performance.now() - started)}ms${worker ? '' : '（メインスレッド）'}`);
+    return 'done';
+  } catch (err) {
+    if (id !== parseSeq) {
+      return 'superseded';
+    }
+    ui.kicadNotice.hidden = true; // 赤字と案内カードが重ならないようにする
+    ui.message.textContent = `モデルを解釈できませんでした: ${err instanceof Error ? err.message : err}`;
+    log(ui.message.textContent);
+    return 'failed';
+  } finally {
+    clearTimeout(slowTimer);
+    if (id === parseSeq && statusMessage === PARSING) {
+      setStatus('');
+    }
+  }
+}
+
+// 読み込みの段階の文言
+const RECEIVING = 'ファイルを受け取り中…';
+const PARSING = '形を組み立て中…';
+const RELOAD_STATUS_DELAY_MS = 400; // 再読込がこれより長くかかったら下の帯に出す
+
+// 状態表示。モデルがまだ無いときは画面の中央に（点 3 つ・段階・ファイル名）、あるときは下の帯に出す。
+// expectedMs があれば経過秒数と、前回の時間を目安にした進み具合のバーを出す。
 // kicad-cli は途中経過を出さないので、バーは見込み。前回の時間までに 9 割まで進め、超えたら 100% の手前でゆっくり近づける
 let statusTimer: ReturnType<typeof setInterval> | undefined;
+let statusMessage = '';
 function setStatus(message: string, expectedMs?: number) {
   if (statusTimer !== undefined) {
     clearInterval(statusTimer);
     statusTimer = undefined;
   }
-  ui.status.textContent = message;
+  statusMessage = message;
+  ui.status.textContent = '';
   ui.progress.hidden = true;
+  ui.loading.hidden = true;
   if (!message) {
     return;
   }
@@ -1099,15 +1145,74 @@ function setStatus(message: string, expectedMs?: number) {
   const tick = () => {
     const elapsed = performance.now() - started;
     const sec = Math.floor(elapsed / 1000);
-    ui.status.textContent = expected ? `${message} ${sec} 秒 / 前回 ${Math.round(expected / 1000)} 秒` : `${message} ${sec} 秒`;
-    if (expected) {
-      const ratio = elapsed < expected ? 0.9 * (elapsed / expected) : 0.9 + 0.09 * (1 - Math.exp(-(elapsed - expected) / expected));
-      ui.progressBar.style.width = `${(ratio * 100).toFixed(1)}%`;
-      ui.progress.hidden = false;
+    const time = expected ? `${sec} 秒 / 前回 ${Math.round(expected / 1000)} 秒` : `${sec} 秒`;
+    const ratio = expected
+      ? elapsed < expected ? 0.9 * (elapsed / expected) : 0.9 + 0.09 * (1 - Math.exp(-(elapsed - expected) / expected))
+      : 0;
+    const width = `${(ratio * 100).toFixed(1)}%`;
+    const center = !hasModel;
+    ui.loading.hidden = !center;
+    ui.status.textContent = center ? '' : `${message} ${time}`;
+    ui.progress.hidden = center || !expected;
+    if (center) {
+      ui.loadingText.textContent = message;
+      ui.loadingName.textContent = ui.name.textContent ?? '';
+      // すぐ終わる読み込みで「0 秒」がちらつかないよう、1 秒たってから出す
+      ui.loadingTime.textContent = expected || sec >= 1 ? time : '';
+      ui.loadingBar.hidden = !expected;
+      ui.loadingBarFill.style.width = width;
+    } else if (expected) {
+      ui.progressBar.style.width = width;
     }
   };
   tick();
   statusTimer = setInterval(tick, 250);
+}
+
+/** load / reload を受け取った。最初の load で、裏から戻ったときの視点と計測があれば戻す */
+let pendingRestore: Partial<ViewState> | null = null;
+async function handleLoad(msg: { type: 'load' | 'reload'; name: string; data: unknown }) {
+  ui.name.textContent = msg.name;
+  if (msg.type === 'reload' && !receivedLoad) {
+    log('最初の load より前の reload を捨てた');
+    return; // 最初の load より前に届いた再読込は捨てる（すぐ後に load が来る）
+  }
+  lastData = toBytes(msg.data);
+  log(`${msg.type} を受け取った: ${lastData.byteLength} バイト`);
+  if (msg.type === 'load' && !receivedLoad) {
+    receivedLoad = true;
+    // 裏から戻って webview が作り直されたとき：前の視点と計測で再開する
+    pendingRestore = (vscode.getState() as Partial<ViewState> | undefined) ?? null;
+  }
+  if (msg.type === 'load' && !pendingRestore) {
+    measure.clear(); // 別のファイルの計測は意味が無い（再読込では形を直しながら測り直せるよう残す）
+  }
+  // 再読込では視点を保つ（形を直しながら同じ角度で見比べられるように）
+  await loadLastData(msg.type === 'load' || !hasModel);
+}
+
+/**
+ * lastData を解析して画面に置き、最初の読み込みなら覚えておいた視点を戻して、描画を確かめる。
+ * 設定の変更で解析し直すときもここを通す（最初の読み込みを追い越したときに、視点を戻す・全体表示する役を引き継ぐため）
+ */
+async function loadLastData(wantFit: boolean) {
+  if (!lastData) {
+    return;
+  }
+  const result = await tryLoad(lastData, !pendingRestore && wantFit);
+  if (result === 'superseded') {
+    return; // 追い越した方が視点を戻し、描画を確かめる
+  }
+  if (pendingRestore) {
+    const saved = pendingRestore;
+    pendingRestore = null;
+    const restored = hasModel && restoreView(saved);
+    log(restored ? `視点を戻した: カメラ ${saved.camera?.join(',')} 注視点 ${saved.target?.join(',')}` : '視点を戻せず全体表示にした');
+    if (hasModel && !restored) {
+      fitView();
+    }
+  }
+  requestProbe('読み込み');
 }
 
 window.addEventListener('message', (event) => {
@@ -1118,6 +1223,9 @@ window.addEventListener('message', (event) => {
       look = { ...DEFAULT_LOOK, ...(msg.look ?? {}) };
       look.colorMap = { ...(look.colorMap ?? {}) };
       look.hiddenLayers = [...(look.hiddenLayers ?? [])];
+      if (msg.name && !ui.name.textContent) {
+        ui.name.textContent = msg.name; // 読み込み中の表示（setStatus が毎回読む）に、届く前からファイル名を出す
+      }
       if (!MATERIALS[look.material]) {
         look.material = DEFAULT_LOOK.material;
       }
@@ -1130,7 +1238,7 @@ window.addEventListener('message', (event) => {
       const creaseChanged = msg.config.creaseAngle !== config.creaseAngle;
       config = { ...DEFAULT_CONFIG, ...msg.config };
       if (creaseChanged && lastData) {
-        tryLoad(lastData, false);
+        void loadLastData(!hasModel); // 最初の読み込みの途中で変わったときは、全体表示もこちらで行う
       } else if (hasModel) {
         layoutScene();
         onCameraChange();
@@ -1139,43 +1247,23 @@ window.addEventListener('message', (event) => {
     }
     case 'load':
     case 'reload':
-      ui.name.textContent = msg.name;
-      if (msg.type === 'reload' && !receivedLoad) {
-        log('最初の load より前の reload を捨てた');
-        break; // 最初の load より前に届いた再読込は捨てる（すぐ後に load が来る）
-      }
-      lastData = toBytes(msg.data);
-      log(`${msg.type} を受け取った: ${lastData.byteLength} バイト`);
-      if (msg.type === 'load' && !receivedLoad) {
-        receivedLoad = true;
-        const saved = vscode.getState() as Partial<ViewState> | undefined;
-        if (saved) {
-          // 裏から戻って webview が作り直されたとき：前の視点と計測で再開する
-          tryLoad(lastData, false);
-          const restored = hasModel && restoreView(saved);
-          log(restored ? `視点を戻した: カメラ ${saved.camera?.join(',')} 注視点 ${saved.target?.join(',')}` : '視点を戻せず全体表示にした');
-          if (hasModel && !restored) {
-            fitView();
-          }
-          requestProbe('読み込み');
-          break;
-        }
-      }
-      if (msg.type === 'load') {
-        measure.clear(); // 別のファイルの計測は意味が無い（再読込では形を直しながら測り直せるよう残す）
-      }
-      // 再読込では視点を保つ（形を直しながら同じ角度で見比べられるように）
-      tryLoad(lastData, msg.type === 'load' || !hasModel);
-      requestProbe('読み込み');
+      void handleLoad(msg);
       break;
     case 'probe':
       requestProbe('手動');
       break;
     case 'error':
       ui.kicadNotice.hidden = true; // 赤字と案内カードが重ならないようにする
+      if (!hasModel) {
+        setStatus(''); // 読み込み中の表示と赤字が重ならないようにする
+      }
       ui.message.textContent = msg.message;
       break;
     case 'status':
+      // 書き出しが済んだ合図（空）は、届いた GLB の解析中なら「形を組み立て中…」を消さない
+      if (!msg.message && statusMessage === PARSING) {
+        break;
+      }
       setStatus(msg.message, msg.expectedMs);
       break;
     case 'kicadMissing':
@@ -1202,4 +1290,6 @@ window.addEventListener('message', (event) => {
 }
 resize();
 frame();
+setStatus(RECEIVING);
+worker = createWorker(); // ファイルが届く前に起こしておき、最初の解析で起動を待たないようにする
 vscode.postMessage({ type: 'ready' });

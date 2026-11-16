@@ -484,6 +484,7 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
             type: 'init',
             config: this.readConfig(),
             isPcb,
+            name: uri.path.split('/').pop(), // 読み込み中の表示に、データが届く前からファイル名を出す
             look: { ...this.context.globalState.get<Look>(STATE_KEY), ...this.fileLooks()[uri.toString()] },
           });
           send('load');
@@ -634,6 +635,8 @@ class StlPreviewProvider implements vscode.CustomReadonlyEditorProvider {
       `img-src ${webview.cspSource} blob: data:`,
       `style-src ${webview.cspSource}`,
       `script-src 'nonce-${nonce}'`,
+      // 解析の Worker は webview.js に埋め込んだ JS を blob から起動する
+      'worker-src blob:',
     ].join('; ');
     return `<!DOCTYPE html>
 <html lang="ja">
