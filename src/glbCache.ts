@@ -5,7 +5,7 @@ import * as path from 'path';
 // 残す GLB の件数。1 枚 10MB 前後なので 20 件で 200MB ほど
 const MAX_ENTRIES = 20;
 // kicad.ts の書き出しの指定を変えたら上げる（前の指定で書き出したものを使わないように）
-const FORMAT = 'glb-v1';
+const FORMAT = 'glb-v3';
 
 /**
  * kicad-cli が書き出した GLB のキャッシュ。基板ファイルの更新日時・大きさと、kicad-cli のパス・版が同じなら使い回す。

@@ -18,7 +18,7 @@
 
 ### 決めたこと
 
-- 書き出しは全部入り（KiCad 9 以降。8 には `--include-pads` `--include-silkscreen` `--include-soldermask` が無いので付けない）: `kicad-cli pcb export glb -f --include-tracks --include-pads --include-zones --include-silkscreen --include-soldermask -o <一時ファイル> <pcb>`（手元の基板で約 11 秒・14MB・32 万三角形）
+- 書き出しは全部入り（KiCad 9 以降。8 には `--include-pads` `--include-silkscreen` `--include-soldermask` が無いので付けない）: `kicad-cli pcb export glb -f --no-dnp --include-tracks --include-pads --include-zones --include-silkscreen --include-soldermask -o <一時ファイル> <pcb>`（手元の基板で約 11 秒・14MB・32 万三角形）
 - kicad-cli の探し方: 設定 `jpstlviewer.kicadCliPath` → PATH の `kicad-cli` → `/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli` → Windows の `C:\Program Files\KiCad\*\bin\kicad-cli.exe`
 - 見つからないときは「KiCad をインストールしてください」と kicad.org のダウンロードページを開くボタン。`kicad-cli version` が 8 未満なら「KiCad 8 以降に更新してください」
 - `.kicad_pcb` 用のカスタムエディタは priority `option`。右クリックの「プレビューで開く」と「KiCad で開く」、プレビュー画面の「KiCad で開く」ボタンを用意する

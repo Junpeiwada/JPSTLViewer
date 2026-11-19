@@ -80,7 +80,7 @@ Three.js の STLLoader と同じ解釈で読む。
 
 `.kicad_pcb` は自前で解釈せず、kicad-cli（KiCad 8 以降）で GLB に書き出して読む。
 
-- 書き出し: `kicad-cli pcb export glb -f --include-tracks --include-pads --include-zones --include-silkscreen --include-soldermask -o <一時ファイル> <pcb>`。全部入りで 10 秒ほどかかり、14MB・32 万三角形ほどになることがある。`fs.mkdtemp` の一時フォルダに書き出して読み、フォルダごと消す。新しい保存が来たら書き出し中のものを中断する。KiCad 8 の `pcb export glb` には `--include-pads` / `--include-silkscreen` / `--include-soldermask` が無いので、KiCad 9 以降のときだけこの 3 つを付ける（8 ではパターンとベタだけで、パッド・シルク・レジストは入らない）
+- 書き出し: `kicad-cli pcb export glb -f --no-dnp --include-tracks --include-pads --include-zones --include-silkscreen --include-soldermask -o <一時ファイル> <pcb>`。全部入りで 10 秒ほどかかり、14MB・32 万三角形ほどになることがある。`fs.mkdtemp` の一時フォルダに書き出して読み、フォルダごと消す。新しい保存が来たら書き出し中のものを中断する。KiCad 8 の `pcb export glb` には `--include-pads` / `--include-silkscreen` / `--include-soldermask` が無いので、KiCad 9 以降のときだけこの 3 つを付ける（8 ではパターンとベタだけで、パッド・シルク・レジストは入らない）。`--no-dnp` は KiCad 8 からあり、「実装しない（DNP）」の部品の 3D モデルを出さない（穴だけのつもりでピンヘッダーのフットプリントを借りた所などに、ピンが立って見えないように）
 - 保存の完了は判定せず（`isCompleteFile` は使わない）、書き出しに失敗したら 1 回だけ間を置いて書き出し直す
 - キャッシュ（`src/glbCache.ts`）: 書き出した GLB を `globalStorageUri/glb/<sha1>.glb` に残す。鍵は書式の版（`FORMAT`）・基板のパス・更新日時・大きさ・kicad-cli のパスと版。使った順に 20 件まで。`kicad.ts` の書き出しの指定を変えたら `FORMAT` を上げる。部品の 3D モデルだけの差し替えには気づかない
 - 進み具合: kicad-cli は途中経過を出さない（測った限り、v2 基板で約 23 秒のうち起動と板で約 6 秒、残りは銅の形作り）。基板ごとの前回の書き出し時間を globalState（`jpstlviewer.exportMs`）に覚えて `status` に `expectedMs` として添え、webview が経過秒数と見込みのバーを出す

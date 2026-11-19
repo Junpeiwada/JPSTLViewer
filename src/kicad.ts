@@ -143,7 +143,8 @@ export async function exportGlb(cli: string, pcb: string, signal: AbortSignal): 
     const out = path.join(dir, 'board.glb');
     // --include-pads / silkscreen / soldermask / inner-copper は KiCad 9 から。8 に渡すと未知の引数で失敗する
     const major = parseInt((await getVersion(cli)) ?? '', 10);
-    const args = ['pcb', 'export', 'glb', '-f', '--include-tracks', '--include-zones'];
+    // --no-dnp: 「実装しない（DNP）」の部品の 3D モデルは出さない（実物に載らない部品が立って見えないように）。KiCad 8 からある
+    const args = ['pcb', 'export', 'glb', '-f', '--no-dnp', '--include-tracks', '--include-zones'];
     if (Number.isFinite(major) && major >= 9) {
       args.push('--include-pads', '--include-silkscreen', '--include-soldermask', '--include-inner-copper');
     }
